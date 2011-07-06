@@ -1,7 +1,11 @@
 Welcome! You've reached Eugene's pet assembly projects.
 
 So far these include
-- mmcp.asm
-        This is a memory mapping approach to copying files, rather than using the traditional Unix read/write interface.
-        How it works: Open source file, create destination file. Map these files to a memory address using mmap(3P). Copy bytes from one address to another like one would with strings, except zero bytes don't terminate the string/file!
-        Written in pure 32-bit x86 assembly using the Linux system call interface only (no glibc). Extremely unportable.
+
+mmcp: An alternative way of copying files.
+
+        mmcp uses a memory mapping approach to copying files, rather than the traditional Unix read/write interface. How it works: Open source file, create destination file. Map these files to memory addresses using mmap(3P). Copy bytes from one address to another like one would with strings, except zero bytes don't terminate the string/file! Written in pure 32-bit x86 assembly using the Linux system call interface only (no glibc). 
+
+        Features:        
+                - Extremely unportable
+                - May be fast
