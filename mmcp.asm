@@ -207,7 +207,7 @@ create_dest_file:
 
 ; Seek to offset in destination file equal to target file size
 stretch_dest_length:
-        ; Use lseek to get file length with returned offset value
+        ; Use lseek to "stretch" file to specified size
         ; int fildes = [ebp-8]
         ; int offset = [ebp-12] - 1
         ; int whence = SEEK_SET
