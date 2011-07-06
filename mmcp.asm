@@ -60,7 +60,7 @@ _start:
         mov     ebp, esp
         sub     esp, 20
 
-; Check that program is called with source and destination 
+; Check that program is called with appropriate arguments
 check_argument_count:
         cmp     dword [ebp], 3 
         je      open_src_file
@@ -78,8 +78,9 @@ check_argument_count:
 open_src_file:
         ; Mode is only used for setting permissions of a new file.
         ; Since mode is ignored here, pass an arbitrary value
-        push    dword 0
+        ; int fildes = [ebp+8]
         ; int oflag = O_RDWR
+        push    dword 0
         push    dword 2q
         push    dword [ebp+8]
         call    fn_open
@@ -89,7 +90,7 @@ open_src_file:
         test    eax, eax        
         js      open_src_error
 
-        ; If successful, store file descriptor in EBP - 4
+        ; If successful, store file descriptor as local variable
         mov     [ebp-4], eax
         jmp     get_file_length
 
@@ -107,8 +108,8 @@ open_src_file:
 get_file_length:
         ; Seek to end of file, returned offset is file length
         ; int fildes = [ebp-4]
-        ; int whence = SEEK_END
         ; off_t offset = 0
+        ; int whence = SEEK_END
         push    dword 2
         push    dword 0
         push    dword [ebp-4]
@@ -119,7 +120,7 @@ get_file_length:
         test    eax, eax        
         js      get_file_length_error
 
-        ; If successful, store source file length in EBP - 12
+        ; If successful, store source file length as local variable
         mov     [ebp-12], eax
         jmp     mmap_src_file
 
@@ -160,7 +161,7 @@ mmap_src_file:
         test    eax, eax        
         jz      mmap_src_file_error
 
-        ; If successful, store source address in EBP - 16
+        ; If successful, store source address as local variable
         mov     [ebp-16], eax
         jmp     create_dest_file
 
@@ -176,10 +177,11 @@ mmap_src_file:
 
 ; Create destination file and store its file descriptor
 create_dest_file:
-        ; Set permissions of new file
-        push    dword 666q
+        ; int fildes = [ebp+12]
         ; int oflag = O_CREAT | O_RDWR | O_TRUNC
-        ; Note: O_WRONLY mode is not sufficient for mmapping
+        ;       Note: O_WRONLY mode is not sufficient for mmapping
+        ; mode_t mode = 0666
+        push    dword 666q
         push    dword (100q | 2q | 1000q)
         push    dword [ebp+12]
         call    fn_open
@@ -189,7 +191,7 @@ create_dest_file:
         test    eax, eax
         js      create_dest_error
 
-        ; If successful, store file descriptor in EBP - 8
+        ; If successful, store file descriptor as local variable
         mov     [ebp-8], eax
         jmp     stretch_dest_length    
 
@@ -205,9 +207,11 @@ create_dest_file:
 
 ; Seek to offset in destination file equal to target file size
 stretch_dest_length:
+        ; Use lseek to get file length with returned offset value
+        ; int fildes = [ebp-8]
+        ; int offset = [ebp-12] - 1
         ; int whence = SEEK_SET
         push    dword 0
-        ; int offset = [ebp-12] - 1
         push    dword [ebp-12]
         dec     dword [esp]
         push    dword [ebp-8]
@@ -229,11 +233,7 @@ stretch_dest_length:
         mov     ebx, 1
         jmp     cleanup_dest_fd
 
-; Write a zero byte to the end in order to set an EOF (?)
-; I'm not sure how an EOF is actually made, is this just an mmap workaround?
-; This is why I think setting an EOF before mmapping is needed, from mmap(3p):
-; References within the address range starting at pa and continuing for len bytes to whole
-; pages following the end of an object shall result in delivery of a SIGBUS signal.
+; Write a zero byte to the end of our newly stretched file to mark an EOF
 write_zero_byte:
         ; sys_write(int fildes, const void *buf, size_t nbyte);
         ; Arguments:
@@ -286,7 +286,7 @@ mmap_dest_file:
         test    eax, eax        
         jz      mmap_dest_file_error
 
-        ; If successful, store destination address in EBP - 20
+        ; If successful, store destination address as local variable
         mov     [ebp-20], eax
         jmp     main_copy
 
