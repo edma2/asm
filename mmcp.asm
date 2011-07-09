@@ -1,39 +1,14 @@
 ; vim: ft=nasm
-; cp-mmap - copy files and directories with memory mapped files
-; Usage: cp <src> <dest>
-; Returns exit code of 0 on success, or 1 on error
+; mmcp - copy files and directories with memory mapped files
 ; Author: Eugene Ma
+; Usage: mmcp <src> <dest>
+; Returns exit status 0 on success, or non-zero on failure.
 
-; Performance:
-; TODO: Do some more robust testing
-; % time ./cp-mmap2 Blade\ Runner.mp4 foo.mp4
-; ./cp-mmap2 Blade\ Runner.mp4 foo.mp4  0.20s user 0.76s system 11% cpu 8.356 total
-
-; % time cp Blade\ Runner.mp4 foo.mp4
-; cp -i Blade\ Runner.mp4 foo.mp4  0.01s user 1.24s system 11% cpu 10.719 total
-
-; With CDECL, all general-purpose registers are preserved except for EAX, ECX, and EDX.
-; Stack with arguments pushed in right to left order
-; 12(ebp) = second function parameter
-; 8(ebp) = first function parameter
-; 4(ebp) = return address (old EIP)
-; 0(ebp) = old base pointer (old EBP)
-; ... saved registers ...
-; ... local variables ...
-
-; [ebp+12] = destination file path 
-; [ebp+8] = source file path
-; [ebp+4] = program name 
-; [ebp] = argument count
-; [ebp-4] = source file descriptor
-; [ebp-8] = destination file descriptor
-; [ebp-12] = source file length
-; [ebp-16] = src mmap return value
-; [ebp-20] = dest mmap return value
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 section .data
-        zeroByte:               db 0
-
         msg_usage_error:        db 'Usage: cp-mmap [src] [dst]', 10
         msg_usage_error_len     equ $-msg_usage_error
 
@@ -52,16 +27,33 @@ section .data
         msg_write_error:        db 'Error: write I/O error', 10
         msg_write_error_len     equ $-msg_write_error
 
+        zeroByte:               db 0
+        block_size              equ 1048576 ; 1MB
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 section .text
         global  _start
 
-; Set up base pointer for sanity
 _start:
+        ; Set up base pointer for sanity
         mov     ebp, esp
-        sub     esp, 20
+        ; [ebp+12] = destination file path 
+        ; [ebp+8] = source file path
+        ; [ebp+4] = program name 
+        ; [ebp] = argument count
+        ; [ebp-4] = source file descriptor
+        ; [ebp-8] = destination file descriptor
+        ; [ebp-12] = source file length in bytes
+        ; [ebp-16] = src mmap address 
+        ; [ebp-20] = dest mmap address
+        ; [ebp-24] = current offset in bytes
+        sub     esp, 24
 
-; Check that program is called with appropriate arguments
 check_argument_count:
+        ; Check that program is called with appropriate arguments
         cmp     dword [ebp], 3 
         je      open_src_file
 
@@ -74,14 +66,14 @@ check_argument_count:
         mov     ebx, 1
         jmp     exit
 
-; Open source file and store its file descriptor 
 open_src_file:
+        ; Open source file and store its file descriptor 
         ; Mode is only used for setting permissions of a new file.
         ; Since mode is ignored here, pass an arbitrary value
-        ; int fildes = [ebp+8]
+        sub     esp, 4
         ; int oflag = O_RDWR
-        push    dword 0
         push    dword 2q
+        ; const char *path = source file ([ebp+8])
         push    dword [ebp+8]
         call    fn_open
         add     esp, 12
@@ -101,17 +93,19 @@ open_src_file:
         call    fn_write_stderr
         add     esp, 8
         ; Store exit status code and exit
-        mov     ebx, 1
+        mov     ebx, eax
         jmp     exit
 
-; Use sys_lseek to determine length of the source file
 get_file_length:
+        ; Use sys_lseek to determine length of the source file.
+        ; The current implementation only works file lengths less than 2 gigabytes.
+        ; Look into using llseek for anything bigger than that.
         ; Seek to end of file, returned offset is file length
-        ; int fildes = [ebp-4]
-        ; off_t offset = 0
         ; int whence = SEEK_END
         push    dword 2
+        ; off_t offset = 0
         push    dword 0
+        ; int fildes = [ebp-4]
         push    dword [ebp-4]
         call    fn_lseek
         add     esp, 12
@@ -122,7 +116,9 @@ get_file_length:
 
         ; If successful, store source file length as local variable
         mov     [ebp-12], eax
-        jmp     mmap_src_file
+        ; Also, store the initial file offset 
+        mov     dword [ebp-24], 0
+        jmp     create_dest_file
 
         ; Otherwise, print error message 
         get_file_length_error:
@@ -131,58 +127,17 @@ get_file_length:
         call    fn_write_stderr
         add     esp, 8
         ; Store exit status code and exit
-        mov     ebx, 1
-        jmp     cleanup_src_fd
+        mov     ebx, eax
+        jmp     close_src
 
-; Map source file to memory
-mmap_src_file:
-        ; sys_old_mmap
-        ; Arguments:
-        ;       void *addr = NULL
-        ;       size_t len = [ebp-12]
-        ;       int prot = PROT_READ
-        ;       int flags = MAP_SHARED
-        ;       int fildes = [ebp-4]
-        ;       off_t off = 0
-        mov     eax, 192
-        mov     ebx, 0          
-        mov     ecx, [ebp-12]
-        mov     edx, 0x1
-        mov     esi, 0x1 
-        mov     edi, [ebp-4]
-        ; Save ebp before call
-        push    ebp
-        mov     ebp, 0          
-        int     0x80
-        ; Restore ebp after call
-        pop     ebp
-
-        ; Check return value
-        test    eax, eax        
-        jz      mmap_src_file_error
-
-        ; If successful, store source address as local variable
-        mov     [ebp-16], eax
-        jmp     create_dest_file
-
-        ; Otherwise, print error message
-        mmap_src_file_error:
-        push    msg_mmap_error_len
-        push    msg_mmap_error
-        call    fn_write_stderr
-        add     esp, 8
-        ; Store exit status code and exit
-        mov     ebx, 1
-        jmp     cleanup_src_fd
-
-; Create destination file and store its file descriptor
 create_dest_file:
-        ; int fildes = [ebp+12]
-        ; int oflag = O_CREAT | O_RDWR | O_TRUNC
-        ;       Note: O_WRONLY mode is not sufficient for mmapping
+        ; Create destination file and store its file descriptor
         ; mode_t mode = 0666
         push    dword 666q
+        ; int oflag = O_CREAT | O_RDWR | O_TRUNC
+        ;       Note: O_WRONLY mode is not sufficient for mmapping
         push    dword (100q | 2q | 1000q)
+        ; const char *path = destination file ([ebp+12])
         push    dword [ebp+12]
         call    fn_open
         add     esp, 12
@@ -202,18 +157,18 @@ create_dest_file:
         call    fn_write_stderr
         add     esp, 8
         ; Store exit status code and exit
-        mov     ebx, 1
-        jmp     cleanup_mmap_src
+        mov     ebx, eax
+        jmp     close_src
 
-; Seek to offset in destination file equal to target file size
 stretch_dest_length:
+        ; Seek to offset in destination file equal to target file size.
         ; Use lseek to "stretch" file to specified size
-        ; int fildes = [ebp-8]
-        ; int offset = [ebp-12] - 1
         ; int whence = SEEK_SET
         push    dword 0
+        ; int offset = file length ([ebp-12] - 1)
         push    dword [ebp-12]
         dec     dword [esp]
+        ; int fildes = destination file descriptor ([ebp-8])
         push    dword [ebp-8]
         call    fn_lseek
         add     esp, 12
@@ -230,25 +185,24 @@ stretch_dest_length:
         call    fn_write_stderr
         add     esp, 8
         ; Store exit status code and exit
-        mov     ebx, 1
-        jmp     cleanup_dest_fd
+        mov     ebx, eax
+        jmp     close_all
 
-; Write a zero byte to the end of our newly stretched file to mark an EOF
 write_zero_byte:
+        ; Write a zero byte to the end of our newly stretched file to mark an EOF
         ; sys_write(int fildes, const void *buf, size_t nbyte);
-        ; Arguments:
-        ;       int fildes = [ebp-8]
-        ;       const void *buf = zeroByte
-        ;       size_t nbyte = 1
         mov     eax, 4
+        ; int fildes = destination file descriptor ([ebp-8])
         mov     ebx, [ebp-8]
+        ; const void *buf = zeroByte
         mov     ecx, zeroByte
+        ; size_t nbyte = 1
         mov     edx, 1
         int     0x80
 
         ; Check return value
         cmp     eax, 1
-        je      mmap_dest_file
+        je      main_loop
 
         ; If error, print error message
         push    msg_write_error_len
@@ -256,107 +210,189 @@ write_zero_byte:
         call    fn_write_stderr
         add     esp, 8
         ; Store exit status code and exit
-        mov     ebx, 1
-        jmp     cleanup_dest_fd
+        mov     ebx, eax
+        jmp     close_all
 
-; Map destination file to memory
-mmap_dest_file:
-        ; sys_old_mmap
-        ; Arguments:
-        ;       void *addr = NULL
-        ;       size_t len = [ebp-12]
-        ;       int prot = PROT_READ|PROT_WRITE
-        ;       int flags = MAP_SHARED
-        ;       int fildes = [ebp-8]
-        ;       off_t off = 0
-        mov     eax, 192
-        mov     ebx, 0          
-        mov     ecx, [ebp-12]
-        mov     edx, (0x1|0x2)
-        mov     esi, 0x1 
-        mov     edi, [ebp-8]
-        ; Save ebp before call
-        push    ebp
-        mov     ebp, 0          
-        int     0x80
-        ; Restore ebp after call
-        pop     ebp
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-        ; Check return value
-        test    eax, eax        
-        jz      mmap_dest_file_error
+main_loop:
+        set_count:
+                ; Move default value to ECX register
+                mov     ecx, block_size
+                ; Compare block size with count of remaining bytes
+                cmp     ecx, [ebp-12]
+                ; If block_size > remaining bytes, we've reached the last block
+                ; Overwrite default value with count of remaining bytes
+                cmovg   ecx, [ebp-12]
 
-        ; If successful, store destination address as local variable
-        mov     [ebp-20], eax
-        jmp     main_copy
+        mmap_src_file:
+                ; Map source file to memory
+                ; size_t len already set in ECX
+                ; sys_old_mmap
+                mov     eax, 192
+                ; void *addr = NULL
+                xor     ebx, ebx          
+                ; int prot = PROT_READ
+                mov     edx, 0x1
+                ; int flags = MAP_SHARED
+                mov     esi, 0x1 
+                ; int fildes = source file descriptor ([ebp-4])
+                mov     edi, [ebp-4]
+                ; Save ebp before call
+                push    ebp
+                ; off_t off = current offset in pages ([ebp-24])
+                mov     ebp, [ebp-24]          
+                ; Convert bytes to pages
+                shr     ebp, 12
+                int     0x80
+                ; Restore ebp after call
+                pop     ebp
 
-        ; Otherwise, print error message
-        mmap_dest_file_error:
-        push    msg_mmap_error_len
-        push    msg_mmap_error
-        call    fn_write_stderr
-        add     esp, 8
-        ; Store exit status code and exit
-        mov     ebx, 1
-        jmp     cleanup_dest_fd
+                ; Check return value
+                cmp     eax, -1        
+                je      mmap_src_file_error
 
-; The main loop of the program
-main_copy:
-        ; Use MOVS instructions to move bytes from memory to memory
-        ; Clear DF flag. Now ESI and EDI are automatically incremented.
-        cld
-        ; Set memory pointers
-        mov     esi, [ebp-16]
-        mov     edi, [ebp-20]
-        ; Set ECX to file size
-        mov     ecx, [ebp-12]
-        ; Move dwords at a time for efficiency
-        ; Divide ECX by 4 since we are moving dwords at a time
-        shr     ecx, 2
-        ; Execute, ignoring the lowest 2 bits of filesize for now
-        rep movsd    
+                ; If successful, store source address as local variable
+                mov     [ebp-16], eax
+                jmp     mmap_dest_file
 
-        ; At this point, memory pointers will be pointing to filesize & 0xfffffffc.
-        ; Let's recover the last two bits in order to take care of the offset.
-        mov     ecx, [ebp-12]
-        and     ecx, 0x3
-        rep movsb    
+                ; Otherwise, print error message
+                mmap_src_file_error:
+                push    msg_mmap_error_len
+                push    msg_mmap_error
+                call    fn_write_stderr
+                add     esp, 8
+                ; Store exit status code and exit
+                mov     ebx, eax
+                jmp     close_all
 
-        ; Store successful exit status
-        mov     ebx, 0
+        mmap_dest_file:
+                ; Map destination file to memory
+                ; sys_old_mmap
+                ; void *addr already set in EBX
+                ; size_t len already set in ECX
+                ; int flags already set in ESI
+                mov     eax, 192
+                ; int prot = PROT_READ | PROT_WRITE
+                ;       Note: PROT_WRITE may not be enough to mmap
+                mov     edx, (0x1|0x2)
+                ; int fildes = destination file descriptor ([ebp-8])
+                mov     edi, [ebp-8]
+                ; Save ebp before call
+                push    ebp
+                ; off_t off = current offset in pages ([ebp-24])
+                mov     ebp, [ebp-24]          
+                ; Convert bytes to pages
+                shr     ebp, 12
+                int     0x80
+                ; Restore ebp after call
+                pop     ebp
 
-; Consolidated clean up procedures start here
-cleanup_all:
-        ; Unmap destination file from memory
-        push    dword [ebp-12]
-        push    dword [ebp-20]
+                ; Check return value
+                cmp     eax, -1        
+                je      mmap_dest_file_error
+
+                ; If successful, store destination address as local variable
+                mov     [ebp-20], eax
+                jmp     copy_block
+
+                ; Otherwise, print error message
+                mmap_dest_file_error:
+                push    msg_mmap_error_len
+                push    msg_mmap_error
+                call    fn_write_stderr
+                add     esp, 8
+                ; Store exit status code and exit
+                mov     ebx, eax
+                jmp     unmap_src
+
+                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                copy_block:
+                        ; Use MOVS instructions to move data between memory locations
+                        ; Clear DF flag. Now ESI and EDI are automatically incremented by MOVS
+                        cld
+                        ; Set memory pointers
+                        mov     esi, [ebp-16]
+                        mov     edi, [ebp-20]
+
+                        ; Store ECX so we can use it again after we perform bit shift
+                        push    ecx
+                        ; Move dwords at a time for efficiency
+                        ; Divide ECX by 4 since we are moving dwords at a time
+                        shr     ecx, 2
+                        ; Execute, ignoring the lowest 2 bits of filesize for now
+                        rep movsd    
+
+                        ; At this point, memory pointers will be pointing to ECX & 0xfffffffc.
+                        ; Let's recover the last two bits in order to take care of the offset.
+                        mov     ecx, [esp]
+                        and     ecx, 0x3
+                        rep movsb    
+
+                        ; Recover count of bytes written this block
+                        pop     ecx
+                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+                ; Local clean up procedure
+                ; Unmap source block from memory
+                push    ecx
+                push    dword [ebp-16]
+                call    fn_munmap
+                add     esp, 8
+                ; Unmap destination block from memory
+                push    ecx
+                push    dword [ebp-20]
+                call    fn_munmap
+                add     esp, 8
+
+                ; Store successful exit status
+                ; We might use this later if we are finished
+                mov     ebx, 0
+
+                ; Increment offset by bytes written
+                add     [ebp-24], ecx
+                ; Decrement count of remaining bytes to write 
+                sub     [ebp-12], ecx
+
+                ; Leave loop if we're done
+                jz      close_all
+
+                ; Otherwise continue next iteration
+                jmp     main_loop
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+unmap_src:
+        ; Unmap source file from memory
+        ;       Note: ECX should contain number of bytes mapped
+        push    ecx
+        push    dword [ebp-16]
         call    fn_munmap
         add     esp, 8
-cleanup_dest_fd:
+close_all:
         ; Close destination file 
         push    dword [ebp-8]
         call    fn_close_fd
         add     esp, 4
-cleanup_mmap_src:
-        ; Unmap source file from memory
-        push    dword [ebp-12]
-        push    dword [ebp-16]
-        call    fn_munmap
-        add     esp, 8
-cleanup_src_fd:
+close_src:
         ; Close source file 
         push    dword [ebp-4]
         call    fn_close_fd
         add     esp, 4
 exit:
-        ; Clean up stack frame
+        ; Clean up stack frame and exit
+        ;       Note: EBX should contain status code
         mov     esp, ebp
-        ; EBX should contain status code. Call sys_exit
         mov     eax, 1
         int     0x80
 
-; Some helpful subroutines
-_functions:
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;
 ; fn_write_stderr
@@ -370,13 +406,12 @@ fn_write_stderr:
         push    ebx
         
         ; sys_write
-        ; Arguments:
-        ;       int fildes = standard error
-        ;       const void *buf = first argument on stack
-        ;       size_t nbyte = second argument on stack
         mov     eax, 4
+        ; int fildes = standard error
         mov     ebx, 2
+        ; const void *buf = first argument on stack
         mov     ecx, [ebp+8]
+        ; size_t nbyte = second argument on stack
         mov     edx, [ebp+12]
         int     0x80
         
@@ -390,21 +425,20 @@ fn_write_stderr:
 ;       Open or create a file
 ;               Arguments: file descriptor, flags, mode
 ;               Returns: if successful, file descriptor, else -1
-; Note: ECX and EDX will be clobbered, along with the usual EAX
+;       Note: ECX and EDX will be clobbered, along with the usual EAX
 fn_open:
         push    ebp
         mov     ebp, esp
         push    ebx
 
         ; sys_open
-        ; Arguments:
-        ;       char path = first argument
-        ;       int oflag = second argument
-        ;       int mode = third argument
-        ; Mode is ignored unless oflag has O_CREAT
         mov     eax, 5 
+        ; char path
         mov     ebx, [ebp+8]
+        ;int oflag
         mov     ecx, [ebp+12]
+        ; int mode
+        ;       Note: Mode is ignored unless oflag has O_CREAT
         mov     edx, [ebp+16]
         int     0x80       
 
@@ -425,9 +459,8 @@ fn_close_fd:
         push    ebx
         
         ; sys_close
-        ; Arguments:
-        ;       int fildes = first argument on stack
         mov     eax, 6
+        ; int fildes
         mov     ebx, [ebp+8]
         int     0x80
         
@@ -448,11 +481,10 @@ fn_munmap:
         push    ebx
         
         ; sys_munmap
-        ; Arguments:
-        ;       void *addr = first argument on stack
-        ;       size_t len = second argument on stack
         mov     eax, 91
+        ; void *addr
         mov     ebx, [ebp+8]
+        ; size_t len
         mov     ecx, [ebp+12]
         int     0x80
         
@@ -473,13 +505,12 @@ fn_lseek:
         push    ebx
 
         ; sys_lseek
-        ; Arguments:
-        ;       int fildes = first argument
-        ;       off_t offset = second argument
-        ;       int whence = third argument
         mov     eax, 19
+        ; int fildes
         mov     ebx, [ebp+8]
+        ; off_t offset
         mov     ecx, [ebp+12]         
+        ; int whence
         mov     edx, [ebp+16]
         int     0x80
 
@@ -487,3 +518,7 @@ fn_lseek:
         mov     esp, ebp
         pop     ebp
         ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
