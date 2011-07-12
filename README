@@ -1,10 +1,13 @@
 Welcome! You've reached Eugene's pet assembly projects.
 
-mmcp: A proof-of-concept for copying files using memory mappings rather than the traditional read and write system calls.
-Description: Copy source file to destination path. Similiar performance to GNU cp.
+mmcp: 
+        A proof-of-concept for copying files using memory mappings rather than the traditional read and write system calls. 
+        Similiar performance to GNU cp. Invoke mmcp -h for usage help.
+
         Features:
                 - Written in pure 32-bit x86 assembly using the Linux system call interface only (no glibc). 
                 - Extremely unportable
         Todo:
+                - Use madvise for paging optimization, llseek for files larger than 2GB
+                - use system call to get page size (?)
                 - Do more performance testing
-                - Allow for files larger than 2 GB.
