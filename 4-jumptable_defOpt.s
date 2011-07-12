@@ -1,9 +1,9 @@
 ; 4-jumptable.c w/ default GCC optimizations, 32-bit x86
-; A comparison of techniques for implementing complex conditional statements.
+; A comparison of implementations for large conditional statements.
 ;       switch statements
 ;       function pointers
 ;       goto labels
-; Assembly output commented by Eugene Ma for fun and profit.
+; Assembly output commented by Eugene Ma
 ; gcc 4-jumptable.c && objdump -D a.out > 4-jumptable_defOpt.s
 
 a.out:     file format elf32-i386
@@ -374,7 +374,7 @@ Disassembly of section .text:
  804843e:	77 58                	ja     8048498 <switch_dispatch+0x64> ; store -1 in eax and exit if above
  8048440:	8b 45 08             	mov    0x8(%ebp),%eax ; EAX = op 
  8048443:	c1 e0 02             	shl    $0x2,%eax ; EAX = 4 * op = jump table index
- 8048446:	05 a0 88 04 08       	add    $0x80488a0,%eax ; jump table starts @ 0x80488a4 and ends at 0x80488a4 + 80
+ 8048446:	05 a0 88 04 08       	add    $0x80488a0,%eax ; jump table starts @ 0x80488a4
  804844b:	8b 00                	mov    (%eax),%eax ; index into jump table with op
  804844d:	ff e0                	jmp    *%eax ; jump to specified location
  804844f:	8b 45 10             	mov    0x10(%ebp),%eax ; EAX = y
@@ -401,8 +401,8 @@ Disassembly of section .text:
  804848b:	c7 04 24 68 88 04 08 	movl   $0x8048868,(%esp) ; push address of error string
  8048492:	e8 d5 fe ff ff       	call   804836c <puts@plt> ; write to stdout
  8048497:	90                   	nop
- 8048498:	b8 ff ff ff ff       	mov    $0xffffffff,%eax ; store -1 in EAX
- 804849d:	c9                   	leave  ; switch_dispatch+0x69: all branches eventually jump here 
+ 8048498:	b8 ff ff ff ff       	mov    $0xffffffff,%eax ; <switch_dispatch+0x64> store -1 in EAX
+ 804849d:	c9                   	leave  ; <switch_dispatch+0x69> all branches eventually reach this point 
  804849e:	c3                   	ret    
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -532,10 +532,9 @@ Disassembly of section .text:
  80485d3:	83 ec 18             	sub    $0x18,%esp
                                         ; EAX = op
  80485d6:	8b 45 08             	mov    0x8(%ebp),%eax
-                                        ; EDX = [4*op + 0x8049d3c]
-                                        ; jumptable seems to be missing OP_ADD 
-                                        ; ex. if op = 1, EDX = 0x80485a3
                                         ; index into jumptable to get "handler" location
+                                        ; EDX = [4*op + 0x8049d38] (jump table seems to be missing OP_ADD)
+                                        ; ex. if op = OP_SUB, EDX = 0x80485a3 <sub>
  80485d9:	8b 14 85 38 9d 04 08 	mov    0x8049d38(,%eax,4),%edx
                                         ; EAX = y
  80485e0:	8b 45 10             	mov    0x10(%ebp),%eax
@@ -543,10 +542,10 @@ Disassembly of section .text:
  80485e3:	89 44 24 04          	mov    %eax,0x4(%esp)
                                         ; EAX = x
  80485e7:	8b 45 0c             	mov    0xc(%ebp),%eax
-                                        ; Store x on top of stack
+                                        ; Store x on stack within local storage
  80485ea:	89 04 24             	mov    %eax,(%esp)
                                         ; Arguments loaded on stack: first x, then y
-                                        ; jump to "handler" address
+                                        ; jump to "handler" function with arguments loaded on stack
  80485ed:	ff d2                	call   *%edx
  80485ef:	c9                   	leave  
  80485f0:	c3                   	ret    
@@ -1393,7 +1392,7 @@ Disassembly of section .data:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-; Contains table of addresses for goto_dispatch
+; Jump table for goto_dispatch
 08049d28 <labeltable.1747>:
 ; [OP_ADD] &&l_add
  8049d28:	87 86 04 08 91 86    	xchg   %eax,-0x796ef7fc(%esi)
@@ -1410,7 +1409,7 @@ Disassembly of section .data:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-; Address table for func_dispatch
+; Jump table for func_dispatch
 08049d38 <jumptable.1733>:
 ; Note: missing OP_ADD address! Zeroed out for now.
  8049d38:	00 00                	add    %al,(%eax)
