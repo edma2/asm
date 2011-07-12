@@ -31,7 +31,7 @@ section .data
         zeroByte:               db 0
         ; To deal with arbitrarily large files, we'll split it up into blocks.
         ; So, we're not limited by the address space of the architecture.
-        block_size              equ 1073741824 ; 1GB
+        blockSize              equ 1073741824 ; 1GB
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -216,10 +216,10 @@ write_zero_byte:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 main_loop:
-        set_block_size:
+        set_blockSize:
                 ; %ecx contains number of bytes to write this block
                 ; Set %ecx to default block size
-                mov     ecx, block_size
+                mov     ecx, blockSize
                 ; Compare block size with bytesToWrite
                 cmp     ecx, [ebp-12]
                 ; If greater, we've reached the last block
@@ -265,7 +265,7 @@ main_loop:
                 add     esp, 8
                 ; Store exit status returned by sys_old_mmap in %ebx and exit
                 mov     ebx, eax
-                jmp     close_dest
+                jmp     cleanup
 
         mmap_dest_file:
                 ; Map destination file to memory
@@ -303,13 +303,17 @@ main_loop:
                 push    msg_mmap_error
                 call    fn_write_stderr
                 add     esp, 8
+                ; Unmap source block from memory
+                push    ecx
+                push    dword [ebp-16]
+                call    fn_munmap
+                add     esp, 8
                 ; Store exit status returned by sys_old_mmap in %ebx and exit
                 mov     ebx, eax
-                jmp     unmap_src
+                jmp     cleanup
 
-                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                ;;; Copy blockSize dwords and bytes at a time using movsd and movsb, respectively
                 copy_block:
-                        ; Use movs instructions to move data between memory locations
                         ; Clear DF flag. Now %esi and %edi are automatically incremented by movs
                         cld
                         ; Set memory pointers
@@ -330,7 +334,6 @@ main_loop:
 
                         ; Recover count of bytes written this block
                         pop     ecx
-                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
                 ; Store successful exit status
                 mov     ebx, 0
@@ -353,31 +356,23 @@ main_loop:
                 sub     [ebp-12], ecx
 
                 ; Leave loop if bytesToWrite = 0
-                jz      close_dest
-                ; Continue next loop
-                jmp     main_loop
+                jnz     main_loop
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-unmap_src:
-        ; Unmap source file from memory
-        ;       Note: %ecx should contain number of bytes mapped
-        push    ecx
-        push    dword [ebp-16]
-        call    fn_munmap
-        add     esp, 8
-close_dest:
-        ; Close destination file 
-        push    dword [ebp-8]
-        call    fn_close_fd
-        add     esp, 4
-close_src:
-        ; Close source file 
-        push    dword [ebp-4]
-        call    fn_close_fd
-        add     esp, 4
+cleanup:
+        close_dest:
+                ; Close destination file 
+                push    dword [ebp-8]
+                call    fn_close_fd
+                add     esp, 4
+        close_src:
+                ; Close source file 
+                push    dword [ebp-4]
+                call    fn_close_fd
+                add     esp, 4
 exit:
         ; Clean up stack frame and exit
         ;       Note: %ebx should contain status code
