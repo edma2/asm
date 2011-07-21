@@ -171,30 +171,31 @@ iptoOctets:
         push    edi
         process_string_loop:
                 load_string_loop:
-                        ; Load the next octet into the allocated local storage. This
-                        ; "local string" can contain up to 3 octet characters, and a
-                        ; null byte. It starts at EBP-4 and ends at EBP.
-                        movsb
                         ; Check if we reached a terminating character, which
                         ; can be either a dot or a null byte.
                         cmp     [esi], byte 0
                         je      convert_str_to_octet
                         cmp     [esi], byte '.'
                         je      convert_str_to_octet
-                        ; Still here? That means we are looking at a character
-                        ; that's neither a dot nor a null char. If EDI is
-                        ; already past the third digit get out of here.
+                        ; If EDI is already past the third digit then abort the
+                        ; function. The return value will probably be
+                        ; incomplete and meaningless, but we currently have no
+                        ; way of letting the caller know. Oh well.
                         cmp     edi, ebp
                         je      octets_ready
+                        ; Still here? That means we are looking at a character
+                        ; that's neither a dot nor a null char. It's probably a
+                        ; valid digit; otherwise, oh well.
+                        movsb
                         jmp     load_string_loop
                 convert_str_to_octet:
-                ; Once we're here, EDI should be pointing to one byte past the
-                ; last octet digit, so terminate the string with a null byte.
+                ; If we're here, EDI should be pointing to where the null byte
+                ; should be placed. Terminate the string so atoul will work.
                 mov     [edi], byte 0
                 ; Beginning of octet string (EDI) is already on stack, so call
                 ; atoul on it, then restore EDI to beginning of local storage.
                 call    atoul
-                mov     edi, [esp]
+                lea     edi, [ebp-4]
                 ; Load the octet represented as a binary number into the lowest
                 ; 8 bits of EBX. Shift existing octets to the left.
                 store_octet:
