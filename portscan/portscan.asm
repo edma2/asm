@@ -9,6 +9,8 @@
 section .data
         msgSocketError:         db 'Error: failed to create socket', 10
         msgSocketErrorLen       equ $-msgSocketError
+        msgParseError:          db 'Error: malformed IP', 10
+        msgParseErrorLen        equ $-msgParseError
         msgConnectError:        db 'Error: failed to connect socket', 10
         msgConnectErrorLen      equ $-msgConnectError
         msgConnectSuccess:      db 'Connected!', 10
@@ -33,6 +35,8 @@ section .bss
 
         ; socket, sockaddr *address, address_len
         connectArgs:    resb (4+4+4)
+
+        octetBuffer:    resb 4
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -79,16 +83,26 @@ prep_sockAddr:
         ; Swap bytes for host-to-network byte order
         xchg    al, ah
         stosw
+        push    octetBuffer
         push    dword [ebp+8]
         call    iptoOctets
-        add     esp, 4
-        ; Reverse bytes for host-to-network byte order
-        bswap   eax 
+        add     esp, 8
+        test    eax, eax
+        js      malformed_ip
+        mov     eax, [octetBuffer]
         stosd
         ; Zero out remaining 8 bytes
         xor     eax, eax
         mov     ecx, 2
         rep stosd
+        jmp     connect_sock
+
+        malformed_ip:
+        push    msgParseErrorLen
+        push    msgParseError
+        call    printStr
+        add     esp, 8
+        jmp     done
 
 connect_sock:
         ; Load up arguments to connect
@@ -149,8 +163,8 @@ exit:
 ; 
 ; iptoOctets
 ;       Converts IPv4 address from text to binary form. 
-;               Arguments: ip string 
-;               Returns: four octets in EAX
+;               Arguments: ip string, destination buffer
+;               Returns: 0 if successful, -1 otherise    
 ;
 iptoOctets:
         push    ebp
@@ -160,57 +174,81 @@ iptoOctets:
         push    esi
         push    edi
 
-        lea     edi, [ebp-4]
         mov     esi, [ebp+8]
-        xor     ebx, ebx
-        cld
-
-        ; Leave this value on top of the stack, it will come in handy later
-        ; because we can restore EDI to the start of local storage, and also,
-        ; it's pre-loaded as an argument for a function call.
+        mov     ebx, [ebp+12]
+        lea     edi, [ebp-4]
+        ; This value comes in handy when its on the stack
         push    edi
-        process_string_loop:
-                load_string_loop:
-                        ; Check if we reached a terminating character, which
-                        ; can be either a dot or a null byte.
-                        cmp     [esi], byte 0
-                        je      convert_str_to_octet
-                        cmp     [esi], byte '.'
-                        je      convert_str_to_octet
-                        ; If EDI is already past the third digit then abort the
-                        ; function. The return value will probably be
-                        ; incomplete and meaningless, but we currently have no
-                        ; way of letting the caller know. Oh well.
+        cld
+        parse_ip:
+                ; Load the string into the four byte buffer we allocated
+                load_string:
+                        ; This loads the next byte from [ESI] into AL
+                        lodsb
+                        ; Check for termination characters
+                        cmp     al, byte 0
+                        je      convert_octet
+                        cmp     al, byte '.'
+                        je      convert_octet
+                        ; Make sure its a valid octet digit (0-9)
+                        cmp     al, byte '0'
+                        jl      invalid_ip
+                        cmp     al, byte '9'
+                        jg      invalid_ip
+                        ; Otherwise this is a valid digit, store it in buffer
+                        stosb
+                        ; Make sure we stored less than 4 bytes in the buffer
                         cmp     edi, ebp
-                        je      octets_ready
-                        ; Still here? That means we are looking at a character
-                        ; that's neither a dot nor a null char. It's probably a
-                        ; valid digit; otherwise, oh well.
-                        movsb
-                        jmp     load_string_loop
-                convert_str_to_octet:
-                ; If we're here, EDI should be pointing to where the null byte
-                ; should be placed. Terminate the string so atoul will work.
+                        jg      invalid_ip
+                        jmp     load_string
+                ; If we reached here, we're ready to convert the octet into its
+                ; binary representation
+                convert_octet:
+                ; First make sure we stored at least one digit
+                cmp     edi, [esp]
+                je      invalid_ip
+                ; Okay, now we've confirmed our octet consists of 1 to 3
+                ; digits, terminate the string by writing the null byte.
                 mov     [edi], byte 0
-                ; Beginning of octet string (EDI) is already on stack, so call
-                ; atoul on it, then restore EDI to beginning of local storage.
+                ; The argument we need is already on the stack, it points to
+                ; the first byte of the octet string
                 call    atoul
+                ; An octet has to be an 8-bit value
+                cmp     eax, 255
+                jg      invalid_ip
+                ; Now load the octet into the destination buffer in big endian
+                ; order/network byte order
+                mov     [ebx], eax
+                count_octets:
+                push    ebx
+                sub     ebx, [ebp+12]
+                cmp     ebx, 3
+                pop     ebx
+                je      last_octet
+                cmp     [esi-1], byte '.' 
+                jne     invalid_ip
+                ; We still have more work to do!
+                prepare_next_octet:
+                ; First, make sure we increment the destination address.
+                inc     ebx
+                ; Finally, reset buffer pointer to start of buffer so we can
+                ; write another octet 
                 lea     edi, [ebp-4]
-                ; Load the octet represented as a binary number into the lowest
-                ; 8 bits of EBX. Shift existing octets to the left.
-                store_octet:
-                shl     ebx, 8
-                mov     bl, al
-                ; ESI should be pointing to either a dot or a null character at
-                ; this point, we're done if its the latter. Increment ESI in
-                ; case its the former (This has no ill-effects otherwise).
-                inc     esi
+                jmp     parse_ip
+                last_octet:
+                ; All four octets are supposedly loaded in the destination
+                ; buffer. This means ESI is must be pointing to a null byte.
                 cmp     [esi-1], byte 0
-                jne     process_string_loop
-        octets_ready:
-        ; Pop ebp-4 off the stack
+                jne     invalid_ip        
+                jmp     parse_success
+        invalid_ip:
+        xor     eax, eax
+        not     eax
+        jmp     exit_ip_to_octets
+        parse_success:
+        xor     eax, eax
+        exit_ip_to_octets:
         add     esp, 4
-        mov     eax, ebx
 
         pop     edi
         pop     esi
@@ -221,8 +259,7 @@ iptoOctets:
 
 ;
 ; atoul 
-;       Converts a null terminated ascii string to an unsigned integer. Does
-;       not check for errors.
+;       Converts a number from text to binary form. 
 ;               Arguments: string address
 ;               Returns: 32-bit unsigned integer in EAX
 ;
