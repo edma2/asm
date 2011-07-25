@@ -1,10 +1,10 @@
 ; vim: ft=nasm
 ; Usage: asmscan [OPTIONS] HOST
 ; Author: Eugene Ma
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; TODO: 
+;       - Implement parallel port scanning with select
+;       - Multiple hosts?
+;       - for reference? http://linux.die.net/man/1/strobe
 
 section .data
         msgStart:               db 'Scanning ports...', 10, 0
@@ -33,6 +33,16 @@ section .bss
         sockAddr:       resb 16
         sockAddrLen     equ (2+2+4+8)
 
+        ; #define __NFDBITS (8 * sizeof(unsigned long))  // bits per file descriptor
+        ; #define __FD_SETSIZE 1024                      // bits per fd_set
+        ; #define __FDSET_LONGS (__FD_SETSIZE/__NFDBITS) // ints per fd_set
+        ;
+        ; typedef struct {
+        ;       unsigned long fds_bits [__FDSET_LONGS];
+        ; } __kernel_fd_set;
+        fdWriteSet:     resb 256
+        fdReadSet:      resb 256
+
         numBuffer:      resb 12
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -43,50 +53,25 @@ section .text
         global  _start
 
 _start:
-        ; Reset frame pointer and allocate local storage
         mov     ebp, esp
-        ; Allocate local storage for socket file descriptor
         sub     esp, 4
 
-create_sock:
-        ; Create socket
-        push    dword 6
-        push    dword 1
-        push    dword 2
-        call    createSock
-        add     esp, 12
-
-        ; Check return value
-        test    eax, eax
-        js      sock_error
-        ; If successful, store return value local variable
-        mov     [ebp-4], eax
-        jmp     prepare_sock
-
-        sock_error:
-        ; Otherwise, store return value as exit status
-        mov     ebx, eax
-        ; Print error message and exit
-        push    msgSocketErrorLen
-        push    msgSocketError
-        call    printStr
-        add     esp, 8
-        jmp     exit
-
-prepare_sock:
-        ; Prepare the sockaddr structure!
-        mov     edi, sockAddr
+prepare_sockaddr_struct:
+        ; Fill out the socket structure we use for our connect calls 
         cld            
-        ; sin_family = AF_INET
+        mov     edi, sockAddr
+        ; sin_family - AF_INET
         mov     ax, 2   
         stosw           
-        ; sin_port = 0 (temporary)
-        ; This value with be incremented with each port scan cycle
+        ; sin_port - dynamic
+        ; Zero out for now
         xor     ax, ax
         stosw
-        ; Generate the correct IPv4 address given the input string
-        push    edi
-        push    dword [ebp+8]
+        ; sin_inaddr -
+        ; Convert argv[1] string to four IPv4 octets, and write directly to
+        ; <sockAddr>
+        push    edi             
+        push    dword [ebp+8]   
         call    iptoOctets
         add     esp, 8
         ; If there are no errors, then the next 4 bytes of structure contains
@@ -98,29 +83,46 @@ prepare_sock:
         xor     eax, eax
         mov     ecx, 2
         rep stosd
-        jmp     initialize_ports
 
+        ; The argument did not represent a valid IP address
         malformed_ip:
         mov     ebx, eax
         push    msgParseErrorLen
         push    msgParseError
         call    printStr
         add     esp, 8
-        jmp     clean_up_and_exit
+        jmp     exit
 
-initialize_ports:
-        ; Iterate through ports with ebx
-        xor     ebx, ebx
-        mov     ebx, 80
-        jmp     cycle_ports
-
-; Scan ports 0-1024
 cycle_ports:
-        ; Store in network byte order
-        mov     [sockAddr+2], byte bh
-        mov     [sockAddr+3], byte bl
+        create_sock:
+                ; Create socket with arguments
+                ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
+                push    dword 6
+                push    dword (1 | 4000q)
+                push    dword 2
+                call    createSock
+                add     esp, 12
 
+                ; Check return value
+                test    eax, eax
+                js      sock_error
+                ; If successful, store return value 
+                mov     [ebp-4], eax
+                jmp     connect_sock
+
+                sock_error:
+                ; Otherwise, store return value as exit status
+                mov     ebx, eax
+                ; Print error message and exit
+                push    msgSocketErrorLen
+                push    msgSocketError
+                call    printStr
+                add     esp, 8
+                jmp     exit
         connect_sock:
+                ; Store port in network byte order
+                mov     [sockAddr+2], byte bh
+                mov     [sockAddr+3], byte bl
                 ; Attempt to connect 
                 push    sockAddrLen
                 push    sockAddr        
@@ -144,15 +146,13 @@ cycle_ports:
                 call    printStr
                 add     esp, 8
         close_connection:
+                push    dword [ebp-4]
+                call    closefd 
+                add     esp, 4
                 inc     ebx
                 cmp     ebx, 1024
-                jle     cycle_ports
+                ;jle     cycle_ports
 
-clean_up_and_exit:
-clean_up:
-        push    dword [ebp-4]
-        call    closefd
-        add     esp, 4
 exit:
         ; ebx contains exit status 
         mov     ebp, esp
@@ -165,8 +165,8 @@ exit:
 
 ; iptoOctets
 ; Converts IPv4 address from text to binary form
-;       Arguments: ip string, destination buffer
-;       Returns: 0 in eax if successful, -1 otherise    
+;       expects: ip string, destination buffer
+;       returns: 0 in eax if successful, -1 otherise    
 iptoOctets:
         push    ebp
         mov     ebp, esp
@@ -260,8 +260,8 @@ iptoOctets:
 
 ; atoul 
 ; Converts a number from text to binary form
-;       Arguments: string address
-;       Returns: 32-bit unsigned integer in eax
+;       expects: string address
+;       returns: 32-bit unsigned integer in eax
 atoul:
         push    ebp
         mov     ebp, esp
@@ -290,8 +290,8 @@ atoul:
 
 ; ultoStr
 ; Converts a number from binary to printable string with newline
-;       Expects: 32-bit unsigned integer, buffer at least 12 bytes
-;       Returns: 0 in eax on success, ~0 otherwise
+;       expects: 32-bit unsigned integer, buffer at least 12 bytes
+;       returns: nothing
 ultoStr:
         push    ebp  
         mov     ebp, esp
@@ -338,6 +338,8 @@ ultoStr:
         mov     [edi+2], byte 0
         mov     [edi+1], byte 10
 
+        ; Start writing bytes to the buffer from least to most significant
+        ; digit (right to left)
         divide_loop:
         ; Else divide edx:eax by 10
         ; eax: quotient contains the rest of input number
@@ -359,14 +361,13 @@ ultoStr:
 
 ; printStr
 ; Prints a string to standard output
-;       Expects: string address, string length
-;       Returns: bytes written in eax | -errno in eax if error
+;       expects: string address, string length
+;       returns: number of bytes written in eax on success, -errno otherwise
 printStr:
         push    ebp
         mov     ebp, esp
         push    ebx
         
-        ; Syscall 4 - sys_write
         mov     eax, 4
         mov     ebx, 1
         mov     ecx, [ebp+8]   
@@ -380,8 +381,8 @@ printStr:
 
 ; strlen
 ; Gets the length of a string
-;       Arguments: string address
-;       Returns: length in eax
+;       expects: string address
+;       returns: length in eax
 strlen:
         push    ebp     
         mov     ebp, esp
@@ -404,14 +405,13 @@ strlen:
 
 ; closefd
 ; Closes a file descriptor
-;       Arguments: file descriptor
-;       Returns: 0 in eax | -errno in eax if error
+;       expects: file descriptor
+;       returns: 0 in eax | -errno in eax if error
 closefd:
         push    ebp
         mov     ebp, esp
         push    ebx
         
-        ; Syscall 6 - sys_close
         mov     eax, 6
         mov     ebx, [ebp+8]
         int     0x80
@@ -421,7 +421,6 @@ closefd:
         pop     ebp
         ret
 
-;
 ; connectSock
 ; Connect a socket       
 ;       expects: int socket, address, address length
@@ -432,9 +431,12 @@ connectSock:
         push    ebx
         push    edi
 
-        ; Syscall 102/3 - sys_connect
         mov     eax, 102
         mov     ebx, 3
+        ; sys_socketcall is a wrapper around all the socket system calls, and
+        ; takes as an argument a pointer to the arguments specific to the
+        ; socket call we want to use, so load ecx with the address of the first
+        ; argument on the stack
         lea     ecx, [ebp+8]
         int     0x80
 
@@ -444,7 +446,6 @@ connectSock:
         pop     ebp
         ret
 
-;
 ; createSock
 ; Create a socket       
 ;       expects: int domain, int type, int protocol
@@ -455,7 +456,6 @@ createSock:
         push    ebx
         push    edi
 
-        ; Syscall 102/1 - sys_socket
         mov     eax, 102
         mov     ebx, 1
         lea     ecx, [ebp+8]
@@ -463,6 +463,46 @@ createSock:
 
         pop     edi
         pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fdSet
+; Add a file descriptor to an fd_set
+;       expects: file descriptor, address of fd_set
+;       returns: nothing
+;
+; static inline void __FD_SET(unsigned long fd, __kernel_fd_set *fdsetp)
+; {
+;       unsigned long _tmp = fd / __NFDBITS;
+;       unsigned long _rem = fd % __NFDBITS;
+;       fdsetp->fds_bits[_tmp] |= (1UL<<_rem);
+; }
+; 
+; Apparently what this does is use the array as a bitmask...
+fdSet:
+        push    ebp
+        mov     ebp, esp
+
+        mov     eax, [ebp+8]
+        mov     edx, [ebp+12]
+        ; Save an additional copy of fd
+        mov     ecx, eax
+
+        ; Divide fd by the number of bits in a 32-bit long, this gives us our
+        ; index into the fds_bits array. 
+        shr     eax, 5
+        ; Note: index is a dword aligned offset 
+        lea     edx, [edx + eax * 4]
+        ; Figure out the appropriate bit to set in the dword-sized array
+        ; element by looking at the last 5 bits of file descriptor
+        and     ecx, 0x1f
+        ; fd_bits[fd/32] |= (1<<rem)
+        xor     eax, eax
+        inc     eax
+        shl     eax, ecx
+        or      [edx], eax
+
         mov     esp, ebp
         pop     ebp
         ret
