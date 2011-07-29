@@ -66,8 +66,7 @@ _start:
         mov     ebp, esp
 
 parse_octets:
-        ; Parse the ip string into octets that are stored in big-endian/network
-        ; byte order
+        ; Parse the ip string into octets 
         push    octetBuffer             
         push    dword [ebp+8]   
         call    iptoOctets
@@ -128,6 +127,7 @@ tcp_scan:
                 call    fdSet
                 add     esp, 4
                 pop     eax
+                ; Should we open another socket?
                 dec     ebx
                 jnz     open_sockets
 
@@ -161,9 +161,6 @@ tcp_scan:
                 je      EAGAIN
                 cmp     eax, 36
                 je      EINPROGRESS
-                cmp     eax, 0
-                ; This shouldn't happen with a non-blocking socket (?)
-                je      connect_success
                 ; If not, something went wrong!
                 jmp     clean_up
                 EAGAIN:
@@ -547,16 +544,10 @@ fdisSet:
 
         mov     eax, [ebp+8]
         mov     edx, [ebp+12]
-        ; Save an additional copy of fd
         mov     ecx, eax
 
-        ; Divide fd by the number of bits in a 32-bit long, this gives us our
-        ; index into the fds_bits array. 
         shr     eax, 5
-        ; Note: index is a dword aligned offset 
         lea     edx, [edx + eax * 4]
-        ; Figure out the appropriate bit to set in the dword-sized array
-        ; element by looking at the last 5 bits of file descriptor
         and     ecx, 0x1f
         ; fd_bits[fd/32] & (1<<rem)
         xor     eax, eax
