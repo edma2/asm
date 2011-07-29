@@ -5,6 +5,8 @@
 ;       - Implement parallel port scanning with select
 ;       - Multiple hosts?
 ;       - for reference? http://linux.die.net/man/1/strobe
+;       - Maintain an array of open file descriptors instead of relying on good
+;       behavior
 
 section .data
         msgStart:               db 'Scanning ports...', 10, 0
@@ -51,6 +53,8 @@ section .bss
 
         octetBuffer:    resd 1
 
+        fdsArray:        resd 36
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -60,7 +64,6 @@ section .text
 
 _start:
         mov     ebp, esp
-        sub     esp, 4
 
 parse_octets:
         ; Parse the ip string into octets that are stored in big-endian/network
@@ -87,81 +90,101 @@ parse_octets:
 load_sockaddr:
         ; Load the struct sockaddr 
         push    dword [octetBuffer]
-        push    dword 0x5000
+        ; The port changes dynamically
+        ; Zero it out for now
+        push    dword 0
         push    sockAddr
         call    loadSockAddr    
         add     esp, 12
 
-load_fdsets:
-        ; Load up the fd_sets
-        push    fdWriteSet
-        call    loadFdSet
-        add     esp, 4
-        push    fdReadSet
-        call    loadFdSet
-        add     esp, 4
-
-cycle_ports:
-        create_sock:
-                ; Create socket with arguments
+tcp_scan:
+        ; Store count of sockets that we need to open
+        mov     ebx, 36
+        ; Using an array, we maintain a list of open file descriptors
+        mov     edi, fdsArray
+        open_sockets:
+                ; Open socket with arguments
                 ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
                 push    dword 6
-                ;push    dword (1 | 4000q)
-                push    dword 1
+                push    dword (1 | 4000q)
                 push    dword 2
                 call    createSock
                 add     esp, 12
 
                 ; Check return value
                 test    eax, eax
-                js      sock_error
-                ; If successful, store return value 
-                mov     [ebp-4], eax
-                jmp     connect_sock
+                js      socket_failed
 
-                sock_error:
+                store_sock:
+                ; Store the resulting file descriptor in fdsArray
+                ; This increments edi for us as well
+                stosd
+                ; In addition, add the file descriptor to fdsets
+                push    eax
+                push    fdWriteSet
+                call    fdSet
+                add     esp, 4
+                push    fdReadSet
+                call    fdSet
+                add     esp, 4
+                pop     eax
+                dec     ebx
+                jnz     open_sockets
+
+        ; Now our sockets are ready to be connected, and the socket array is
+        ; filled up, as well as the fd_set structs
+        
+        ; Connect all 36 sockets at once
+        mov     ebx, 36
+        mov     esi, fdsArray
+        connect_sockets:
+                ; Load the file descriptor in eax
+                lodsd
+                ; Unscramble, increment, re-scramble, and load port
+                mov     cx, word [sockAddr+2]
+                xchg    cl, ch
+                inc     cx
+                xchg    cl, ch
+                mov     cx, word [sockAddr+2]
+                ; Initiate TCP handshake for current port and socket
+                push    sockAddrLen
+                push    sockAddr        
+                push    eax
+                call    connectSock
+                add     esp, 12
+                ; Negate return value since it contains -errno
+                not     eax
+                inc     eax
+                ; Is it EAGAIN or EINPROGRESS, as expected?
+                check_return_value:
+                cmp     eax, 35
+                je      EAGAIN
+                cmp     eax, 36
+                je      EINPROGRESS
+                cmp     eax, 0
+                ; This shouldn't happen with a non-blocking socket (?)
+                je      connect_success
+                ; If not, something went wrong!
+                jmp     clean_up
+                EAGAIN:
+                EINPROGRESS:
+                connect_success:
+                dec     ebx
+                jnz     connect_sockets
+                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+        ; Phase II: Call select 
+        call_select:
+
                 ; Otherwise, store return value as exit status
-                mov     ebx, eax
                 ; Print error message and exit
+                socket_failed:
+                mov     ebx, eax
                 push    msgSocketErrorLen
                 push    msgSocketError
                 call    printStr
                 add     esp, 8
                 jmp     exit
-        connect_sock:
-                ; Store port in network byte order
-                ;mov     [sockAddr+2], byte bh
-                ;mov     [sockAddr+3], byte bl
-                ; Attempt to connect 
-                push    sockAddrLen
-                push    sockAddr        
-                push    dword [ebp-4]
-                call    connectSock
-                add     esp, 4
-                ; Connect is successful if it returned 0
-                cmp     eax, 0
-                je      connect_success
-                jmp     close_connection
-        connect_success:
-                ; If the connect succeeded, print out the port as a string
-                push    numBuffer
-                push    dword 80
-                call    ultoStr
-                add     esp, 4
-                call    strlen
-                add     esp, 4
-                push    eax
-                push    numBuffer
-                call    printStr
-                add     esp, 8
-        close_connection:
-                push    dword [ebp-4]
-                call    closefd 
-                add     esp, 4
-                inc     ebx
-                cmp     ebx, 1024
-                ;jle     cycle_ports
-
+                        
 exit:
         ; ebx contains exit status 
         mov     ebp, esp
@@ -475,9 +498,9 @@ createSock:
         pop     ebp
         ret
 
-; loadFdSet:
-;       Fill up a struct fd_set. See description.
-;               Arguments: pointer to struct fd_set
+; fdSet
+;       Add a file descriptor to struct fd_set
+;               Arguments: pointer to struct fd_set, fd
 ;               Returns: nothing
 ;
 ; Description:
@@ -487,35 +510,65 @@ createSock:
 ; ints, and every possible file descriptor is mapped to a bit position.
 ; e.g. (31|30|29|...|1|0) (63|62|61|...|33|32) ...
 ;
-; Since we plan on using 128 (?) ports at a time, we'll have to open up
-; 128 additional file descriptors, the mappings will start at 3 and end
-; at 130, assuming they are assigned to our program in sequential order
-; (otherwise we're screwed).
-loadFdSet:
+fdSet:
         push    ebp
         mov     ebp, esp
 
-        ; Load address into ecx
-        mov     ecx, [ebp+8]
-        ; Turn on all bits in eax
+        mov     eax, [ebp+8]
+        mov     edx, [ebp+12]
+        ; Save an additional copy of fd
+        mov     ecx, eax
+
+        ; Divide fd by the number of bits in a 32-bit long, this gives us our
+        ; index into the fds_bits array. 
+        shr     eax, 5
+        ; Note: index is a dword aligned offset 
+        lea     edx, [edx + eax * 4]
+        ; Figure out the appropriate bit to set in the dword-sized array
+        ; element by looking at the last 5 bits of file descriptor
+        and     ecx, 0x1f
+        ; fd_bits[fd/32] |= (1<<rem)
         xor     eax, eax
-        not     eax
-        ; Shift out lower 3 bits (0b...11111000)
-        shl     eax, 3
-        ; Turn on bits 3-31
-        mov     dword [ecx], eax
-        ; Load bits 32-63
-        sar     eax, 3
-        mov     dword [ecx+4], eax
-        ; Load bits 64-95
-        mov     dword [ecx+8], eax
-        ; Load bits 64-95
-        mov     dword [ecx+12], eax
-        ; Load bits 96-127
-        mov     dword [ecx+16], eax
-        ; Load bits 128-130
-        shr     eax, 29
-        mov     dword [ecx+20], eax
+        inc     eax
+        shl     eax, cl
+        or      [edx], eax
+
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fdisSet
+;       Check if a file descriptor is in fd_set
+;               Arguments: pointer to struct fd_set, fd
+;               Returns: 0 if true, ~0 otherwise
+fdisSet:
+        push    ebp
+        mov     ebp, esp
+
+        mov     eax, [ebp+8]
+        mov     edx, [ebp+12]
+        ; Save an additional copy of fd
+        mov     ecx, eax
+
+        ; Divide fd by the number of bits in a 32-bit long, this gives us our
+        ; index into the fds_bits array. 
+        shr     eax, 5
+        ; Note: index is a dword aligned offset 
+        lea     edx, [edx + eax * 4]
+        ; Figure out the appropriate bit to set in the dword-sized array
+        ; element by looking at the last 5 bits of file descriptor
+        and     ecx, 0x1f
+        ; fd_bits[fd/32] & (1<<rem)
+        xor     eax, eax
+        inc     eax
+        shl     eax, cl
+        ; Use ecx as constant -1
+        xor     ecx, ecx
+        not     ecx
+        test    [edx], eax
+        mov     eax, 0
+        ; Return an error value if the bit was not set
+        cmove   eax, ecx
 
         mov     esp, ebp
         pop     ebp
