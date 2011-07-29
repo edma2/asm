@@ -16,6 +16,8 @@ section .data
         msgSocketErrorLen       equ $-msgSocketError
         msgParseError:          db 'Error: malformed IP address', 10, 0
         msgParseErrorLen        equ $-msgParseError
+        msgConnectError:        db 'Error: failed to connect socket', 10, 0
+        msgConnectErrorLen      equ $-msgConnectError
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
@@ -97,10 +99,10 @@ load_sockaddr:
         add     esp, 12
 
 tcp_scan:
-        ; Store count of sockets that we need to open
+        ; Open all 36 sockets at once
         mov     ebx, 36
-        ; Using an array, we maintain a list of open file descriptors
         mov     edi, fdsArray
+
         open_sockets:
                 ; Open socket with arguments
                 ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
@@ -112,7 +114,20 @@ tcp_scan:
 
                 ; Check return value
                 test    eax, eax
-                js      socket_failed
+                js      open_failed
+                jmp     store_sock
+        
+                open_failed:
+                dec     edi
+                push    edi
+                push    fdsArray
+                call    closefdArray
+                add     esp, 4
+                push    msgSocketErrorLen
+                push    msgSocketError
+                call    printStr
+                add     esp, 8
+                jmp     exit
 
                 store_sock:
                 ; Store the resulting file descriptor in fdsArray
@@ -134,9 +149,10 @@ tcp_scan:
         ; Now our sockets are ready to be connected, and the socket array is
         ; filled up, as well as the fd_set structs
         
-        ; Connect all 36 sockets at once
+        ; Connect all 36 sockets in parallel 
         mov     ebx, 36
         mov     esi, fdsArray
+
         connect_sockets:
                 ; Load the file descriptor in eax
                 lodsd
@@ -152,23 +168,38 @@ tcp_scan:
                 push    eax
                 call    connectSock
                 add     esp, 12
-                ; Negate return value since it contains -errno
-                not     eax
-                inc     eax
-                ; Is it EAGAIN or EINPROGRESS, as expected?
                 check_return_value:
-                cmp     eax, 35
+                ; This shouldn't happen
+                cmp     eax, 0
+                je      connect_success
+                ; Is it EAGAIN or EINPROGRESS, as expected?
+                cmp     eax, -35
                 je      EAGAIN
-                cmp     eax, 36
+                cmp     eax, -36
                 je      EINPROGRESS
                 ; If not, something went wrong!
-                jmp     clean_up
+                connect_fail:
+                dec     esi
+                push    esi
+                push    fdsArray
+                call    closefdArray
+                add     esp, 4
+                push    msgConnectErrorLen
+                push    msgConnectError
+                call    printStr
+                add     esp, 8
+                jmp     exit
+
                 EAGAIN:
                 EINPROGRESS:
                 connect_success:
                 dec     ebx
                 jnz     connect_sockets
-                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+        ; Now our sockets should all be trying to connect
+        ; Sleep a little bit, then use select to check up on them
+
+        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
         ; Phase II: Call select 
         call_select:
 
@@ -445,6 +476,31 @@ closefd:
         int     0x80
         
         pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; closefdArray
+;       Closes all file descriptors in the array to the left of pointer
+;               Arguments: array, pointer to last element
+;               Returns: nothing
+closefdArray:
+        push    ebp
+        mov     ebp, esp
+
+        mov     ecx, [ebp+8]
+        mov     edx, [ebp+12]
+
+        close_all:
+                cmp     ecx, edx
+                je      close_done
+                push    edx
+                call    closefd
+                add     esp, 4
+                sub     edx, 4
+                jmp     close_all
+
+        close_done:
         mov     esp, ebp
         pop     ebp
         ret
