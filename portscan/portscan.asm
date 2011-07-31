@@ -9,9 +9,12 @@
 section .data
         msg_start:              db 'Scanning ports...', 10, 0
         msg_sock_err:           db 'Error: failed to create socket', 10, 0
+        msg_select_err:         db 'Error: select(3) failed', 10, 0
         msg_parse_err:          db 'Error: malformed IP address', 10, 0
         msg_connect_err:        db 'Error: failed to connect socket', 10, 0
         msg_connect_success:    db 'Connect succeeded!', 10, 0
+                
+        newline:                db 10, 0
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
@@ -51,6 +54,8 @@ section .bss
         fd_array:        resd 32
 
         octet_buf:       resd 1
+        ; For storing the port string
+        port_buf:        resb 12
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -61,21 +66,6 @@ section .text
 
 _start:
         mov ebp, esp
-
-debug:
-        push dword 6
-        push fdset_write
-        call f_fdset_add 
-        add esp, 8
-
-        push dword 20
-        push fdset_write
-        call f_fdset_add 
-        add esp, 8
-
-        mov eax, 1
-        mov ebx, 0
-        int 0x80
 
 parse_octets:
         ; Parse the ip string into octets 
@@ -111,10 +101,10 @@ load_sockaddr:
 tcp_scan:
         initialize_scan:
         ; Initialize port counter (e.g. for (i = 0...))
-        mov bx, word 0
+        xor ebx, ebx
         ; JUMP here for after every 32 ports scanned
         ;-----------------------------------------[
-        new_loop:
+        main_loop:
                 ; Reset array pointer
                 mov edi, fd_array
                 ; JUMP here to prepare a port for select
@@ -137,14 +127,15 @@ tcp_scan:
                         
                         open_failed:
                         ; Close all the sockets we opened up so far
-                        push edi
+                        and bx, word 0x1f
+                        push ebx
                         push fd_array
                         call f_close_fd_array
-                        add esp, 4
+                        add esp, 8
                         ; Print socket error message and exit
                         push msg_sock_err
                         call f_print_str
-                        add esp, 8
+                        add esp, 4
                         jmp exit
 
                         store_fd:
@@ -163,8 +154,9 @@ tcp_scan:
                         call_connect:
                         ; Load port
                         xchg bl, bh
-                        mov word [sockaddr+2], bx
-                        ; Initiate TCP handshake for current port and socket
+                        mov [sockaddr+2], word bx
+                        xchg bl, bh
+                        ; Initiate TCP handshake
                         push sockaddr_len
                         push sockaddr        
                         push eax
@@ -183,21 +175,24 @@ tcp_scan:
 
                         ; If not, something went wrong
                         wrong_errno:
-                        push edi
+                        and bx, word 0x1f
+                        push ebx
                         push fd_array
                         call f_close_fd_array
-                        add esp, 4
+                        add esp, 8
                         push msg_connect_err
                         call f_print_str
-                        add esp, 8
+                        add esp, 4
                         jmp exit
 
                         connect_ok:
+                        inc word bx
                         ; Check if port is a multiple of 32, which is true if
                         ; the lowest 5 bits are cleared
-                        and bx, 0x1f
+                        test bx, word 0x1f
                         jz wait_for_sockets
                         jmp connect_loop
+                ;-----------------------------------------[
 
                 ; Sleep for a few seconds before selecting 
                 wait_for_sockets:
@@ -215,7 +210,56 @@ tcp_scan:
                 push dword fdset_write
                 push dword fdset_read
                 push dword [fd_array+32]
+                call f_select
+                add esp, 20
+                cmp eax, 0
+                js select_failed
+                ; Scan the next 32 ports
+                je main_loop
+                jmp check_fdset
 
+                select_failed:
+                ; Close all the sockets we opened up so far
+                push 32
+                push fd_array
+                call f_close_fd_array
+                add esp, 8
+                ; Print socket error message and exit
+                push msg_select_err
+                call f_print_str
+                add esp, 4
+                jmp exit
+
+                check_fdset:
+                ; Check each file descriptor in the array for its status in
+                ; fdset, print out the ports that are set 
+                mov esi, fd_array
+                mov ecx, 32
+                fdset_loop:
+                        lodsd
+                        ; fd in eax
+                        push eax
+                        push fdset_read
+                        call f_fdset_check
+                        add esp, 4
+                        ; If eax is 0, then fildes not set
+                        cmp eax, 0
+                        pop eax
+                        jz fdset_loop
+                        ; Otherwise print the port number followed by a newline
+                        push dword port_buf
+                        push eax
+                        call f_ultostr
+                        add esp, 4
+                        call f_print_str
+                        mov [esp], dword newline
+                        call f_print_str
+                        add esp, 4
+                        dec ecx
+                        jnz fdset_loop
+                cmp bx, word 0
+                jne main_loop
+        ;-----------------------------------------[
 exit:
         mov ebp, esp
         mov eax, 1
@@ -603,13 +647,13 @@ f_fdset_add:
 
 ; f_fdset_check - check if a file descriptor is present in fd_set
 ;       expects: pointer to struct fd_set, fd
-;       returns: 0 if true, !0 otherwise
+;       returns: !0 if true, 0 otherwise
 f_fdset_check:
         push ebp
         mov ebp, esp
 
-        mov eax, [ebp+8]
-        mov edx, [ebp+12]
+        mov edx, [ebp+8]
+        mov eax, [ebp+12]
         mov ecx, eax
 
         shr eax, 5
