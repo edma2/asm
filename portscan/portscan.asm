@@ -25,6 +25,8 @@ section .data
 
         ERRNO_EAGAIN          equ -115
         ERRNO_EINPROGRESS     equ -11
+        
+        MAX_PARALLEL_SOCKS    equ 32
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -97,20 +99,22 @@ load_sockaddr:
         call f_load_sockaddr    
         add esp, 12
 
-;-----------------------------------------[
+; Scanning method: Use connect(2) to try to establish TCP connections for a set
+; of sockets (MAX_PARALLEL_SOCKS), each mapped to a different port. Then use
+; select(2) to determine which sockets have non-blocking read and writes.  If
+; the port is open, we should be able to read from and write to the socket.
+; Otherwise it is considered filtered or closed. 
 tcp_scan:
-        initialize_scan:
-        ; Initialize port counter (e.g. for (i = 0...))
+        ; Use ebx to track the port we're currently on, start at port 0
         xor ebx, ebx
-        ; JUMP here for after every 32 ports scanned
-        ;-----------------------------------------[
-        main_loop:
+        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+        ; Scan the next set of ports
+        parallel_scan:
                 ; Reset array pointer
                 mov edi, fd_array
-                ; JUMP here to prepare a port for select
-                ;-----------------------------------------[
-                connect_loop:
-                        connect_fds:
+                ; Initiate connections in parallel for multiple sockets
+                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                gather_sockets:
                         ; Open socket with arguments
                         ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
                         call_socket:
@@ -120,14 +124,18 @@ tcp_scan:
                         call f_socket
                         add esp, 12
 
-                        ; Check returned fd
+                        ; Check returned fildes
                         test eax, eax
                         js open_failed
                         jmp store_fd
                         
+                        ; Close all the sockets we opened up so far, print
+                        ; error message and quit
                         open_failed:
-                        ; Close all the sockets we opened up so far
-                        and bx, word 0x1f
+                        ; Extract the last 5 bits of ebx to obtain the offset
+                        ; into fd_array, since we scan 32 ports at a time
+                        ; before reseting the pointer.
+                        and ebx, 0x1f
                         push ebx
                         push fd_array
                         call f_close_fd_array
@@ -138,44 +146,46 @@ tcp_scan:
                         add esp, 4
                         jmp exit
 
+                        ; If the file descriptor was good, store it in the array.
                         store_fd:
-                        ; If the file descriptor was good, store it in the array
-                        ; DF should already be set, so edi is incremented 
                         stosd
-                        ; Then add it to fdsets so we can check it later with select
+                        ; Also store it in fd_set structs which are monitored
+                        ; later by select(2)
                         push eax
                         push fdset_write
                         call f_fdset_add
                         mov [esp], dword fdset_read
                         call f_fdset_add
                         add esp, 4
+                        ; Restore fd in eax
                         pop eax
 
                         call_connect:
                         ; Load port
-                        xchg bl, bh
-                        mov [sockaddr+2], word bx
-                        xchg bl, bh
+                        mov [sockaddr+2], byte bh
+                        mov [sockaddr+3], byte bl
                         ; Initiate TCP handshake
                         push sockaddr_len
                         push sockaddr        
                         push eax
                         call f_connect
                         add esp, 12
+                        ; Increase the port counter (e.g. 0->1)
+                        inc word bx
 
                         check_return_value:
-                        ; Impossible for a non-blocking socket?
-                        cmp eax, 0
-                        je connect_ok
                         ; Is it EAGAIN or EINPROGRESS, as expected?
                         cmp eax, ERRNO_EAGAIN
                         je connect_ok
                         cmp eax, ERRNO_EINPROGRESS
                         je connect_ok
+                        ; Impossible for a non-blocking socket?
+                        cmp eax, 0
+                        je connect_ok
 
-                        ; If not, something went wrong
+                        ; Bail out if errno was not one of the above
                         wrong_errno:
-                        and bx, word 0x1f
+                        and ebx, 0x1f
                         push ebx
                         push fd_array
                         call f_close_fd_array
@@ -186,16 +196,15 @@ tcp_scan:
                         jmp exit
 
                         connect_ok:
-                        inc word bx
-                        ; Check if port is a multiple of 32, which is true if
-                        ; the lowest 5 bits are cleared
+                        ; Check if we should call select(2) or gather more sockets
                         test bx, word 0x1f
-                        jz wait_for_sockets
-                        jmp connect_loop
-                ;-----------------------------------------[
+                        jz wait_for_slow_connects
+                        jmp gather_sockets
+                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-                ; Sleep for a few seconds before selecting 
-                wait_for_sockets:
+                ; Sleep for one second in case some connections are slow
+                ; zzz... zzz...
+                wait_for_slow_connects:
                 push one_sec_timeout
                 push dword 0
                 push dword 0
@@ -204,66 +213,121 @@ tcp_scan:
                 call f_select
                 add esp, 20
         
-                monitor_fds:
+                ; Wake up and smell the ashes...
+                ; It's time to check up on our sockets
+                call_select:
                 push zero_timeout
                 push dword 0
                 push dword fdset_write
                 push dword fdset_read
-                push dword [fd_array+32]
+                push dword [fd_array+MAX_PARALLEL_SOCKS]
                 call f_select
                 add esp, 20
+
+                ; If select returned 0, then no sockets were able to connect
+                ; Otherwise, select will return the total number of fildes that
+                ; are ready. In case of error, it returns -errno.
                 cmp eax, 0
                 js select_failed
-                ; Scan the next 32 ports
-                je main_loop
-                jmp check_fdset
+                je close_sockets
+                jmp check_for_connected_sockets
 
+                ; Something went wrong with our select(2) call
                 select_failed:
-                ; Close all the sockets we opened up so far
-                push 32
+                ; Store -errno in ebx
+                mov ebx, eax
+                ; Close all the sockets we opened up
+                push MAX_PARALLEL_SOCKS
                 push fd_array
                 call f_close_fd_array
                 add esp, 8
-                ; Print socket error message and exit
+                ; Print error message and exit
                 push msg_select_err
                 call f_print_str
                 add esp, 4
                 jmp exit
 
-                check_fdset:
+                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                check_for_connected_sockets:
                 ; Check each file descriptor in the array for its status in
-                ; fdset, print out the ports that are set 
+                ; fdset_read and fdset_write, printing out the ports that are
+                ; non-blocking  We'll load fds one at a time from the array to
+                ; eax using lodsd, so point esi to fd_array.
                 mov esi, fd_array
-                mov ecx, 32
-                fdset_loop:
+                process_next_fd:
+                        ; Load next fd in eax
                         lodsd
-                        ; fd in eax
+
+                        ; Will a read block?
                         push eax
                         push fdset_read
                         call f_fdset_check
                         add esp, 4
-                        ; If eax is 0, then fildes not set
+
+                        ; Restore eax in case we still need it. No flags are
+                        ; set by the pop instruction. This is neccesary in the
+                        ; case we have to jump; the stack will be properly
+                        ; aligned. Otherwise, we will have the original fd
+                        ; preserved and loaded in eax.
                         cmp eax, 0
                         pop eax
-                        jz fdset_loop
-                        ; Otherwise print the port number followed by a newline
-                        push dword port_buf
+                        je process_next_fd
+
+                        ; Will a write block?
                         push eax
+                        push fdset_write
+                        call f_fdset_check
+                        add esp, 8
+                        cmp eax, 0
+                        je process_next_fd
+                        
+                        ; If we reached this point, then the socket connected
+                        ; successfully to the remote host. Notify the user as
+                        ; open ports are found by printing the open port to
+                        ; standard output.
+
+                        ; Calculate port number associated with the fd
+                        ; esi is a pointer to offset within fd_array
+                        ; ebx is the highest port number so far
+                        ; Thus, port is ebx - MAX_PARALLEL_SOCKS + offset
+                        lea edx, [ebx + esi - MAX_PARALLEL_SOCKS]
+                        sub edx, fd_array
+
+                        ; Convert the port to a string and store the result in
+                        ; port_buf, then print the string to standard output.
+                        push dword port_buf
+                        push edx
                         call f_ultostr
+                        ; port_buf now on stack
                         add esp, 4
                         call f_print_str
+
+                        ; Replace port_buf with buffer containing newline and
+                        ; print it 
                         mov [esp], dword newline
                         call f_print_str
                         add esp, 4
-                        dec ecx
-                        jnz fdset_loop
+
+                        ; Calculate offset and figure out if we finished loop
+                        mov edx, esi
+                        sub edx, fd_array
+                        cmp edx, MAX_PARALLEL_SOCKS
+                        jne process_next_fd
+                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                close_sockets:
+                ; Close all the sockets we opened 
+                push MAX_PARALLEL_SOCKS
+                push fd_array
+                call f_close_fd_array
+                add esp, 8
+                ; Quit when we've scanned ports 0-65535 
                 cmp bx, word 0
-                jne main_loop
-        ;-----------------------------------------[
+                jne parallel_scan
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 exit:
         mov ebp, esp
         mov eax, 1
-        ; ebx contains exit status 
+        ; We expect ebx to contain exit status 
         int 0x80
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
