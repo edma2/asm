@@ -85,6 +85,9 @@ parse_octets:
         push msg_parse_err
         call f_print_str
         add esp, 8
+        ; Set error status to -1
+        xor ebx, ebx
+        not ebx
         jmp exit
 
 load_sockaddr:
@@ -130,6 +133,8 @@ tcp_scan:
                         ; Close all the sockets we opened up so far, print
                         ; error message and quit
                         open_failed:
+                        ; Save -errno
+                        push eax
                         ; Extract the last 5 bits of ebx to obtain the offset
                         ; into fd_array, since we scan 32 ports at a time
                         ; before reseting the pointer.
@@ -142,6 +147,8 @@ tcp_scan:
                         push msg_sock_err
                         call f_print_str
                         add esp, 4
+                        ; Set -errno as exit status
+                        pop ebx
                         jmp exit
 
                         ; If the file descriptor was good, store it in the array.
@@ -183,6 +190,8 @@ tcp_scan:
 
                         ; Bail out if errno was not one of the above
                         wrong_errno:
+                        ; Save -errno
+                        push eax
                         and ebx, 0x1f
                         push ebx
                         push fd_array
@@ -191,6 +200,8 @@ tcp_scan:
                         push msg_connect_err
                         call f_print_str
                         add esp, 4
+                        ; Set -errno as error status
+                        pop ebx
                         jmp exit
 
                         connect_ok:
