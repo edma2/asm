@@ -26,8 +26,6 @@ section .data
         ERRNO_EAGAIN          equ -115
         ERRNO_EINPROGRESS     equ -11
         
-        MAX_PARALLEL_SOCKS    equ 32
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -100,10 +98,10 @@ load_sockaddr:
         add esp, 12
 
 ; Scanning method: Use connect(2) to try to establish TCP connections for a set
-; of sockets (MAX_PARALLEL_SOCKS), each mapped to a different port. Then use
-; select(2) to determine which sockets have non-blocking read and writes.  If
-; the port is open, we should be able to read from and write to the socket.
-; Otherwise it is considered filtered or closed. 
+; of sockets (32), each mapped to a different port. Then use select(2) to
+; determine which sockets have non-blocking read and writes.  If the port is
+; open, we should be able to read from and write to the socket.  Otherwise it
+; is considered filtered or closed. 
 tcp_scan:
         ; Use ebx to track the port we're currently on, start at port 0
         xor ebx, ebx
@@ -220,7 +218,7 @@ tcp_scan:
                 push dword 0
                 push dword fdset_write
                 push dword fdset_read
-                push dword [fd_array+MAX_PARALLEL_SOCKS]
+                push dword [fd_array+32]
                 call f_select
                 add esp, 20
 
@@ -237,7 +235,7 @@ tcp_scan:
                 ; Store -errno in ebx
                 mov ebx, eax
                 ; Close all the sockets we opened up
-                push MAX_PARALLEL_SOCKS
+                push 32
                 push fd_array
                 call f_close_fd_array
                 add esp, 8
@@ -289,8 +287,8 @@ tcp_scan:
                         ; Calculate port number associated with the fd
                         ; esi is a pointer to offset within fd_array
                         ; ebx is the highest port number so far
-                        ; Thus, port is ebx - MAX_PARALLEL_SOCKS + offset
-                        lea edx, [ebx + esi - MAX_PARALLEL_SOCKS]
+                        ; Thus, port is ebx - 32 + offset
+                        lea edx, [ebx + esi - 32]
                         sub edx, fd_array
 
                         ; Convert the port to a string and store the result in
@@ -311,12 +309,12 @@ tcp_scan:
                         ; Calculate offset and figure out if we finished loop
                         mov edx, esi
                         sub edx, fd_array
-                        cmp edx, MAX_PARALLEL_SOCKS
+                        cmp edx, 32
                         jne process_next_fd
                 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
                 close_sockets:
                 ; Close all the sockets we opened 
-                push MAX_PARALLEL_SOCKS
+                push dword 32
                 push fd_array
                 call f_close_fd_array
                 add esp, 8
