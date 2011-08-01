@@ -108,13 +108,17 @@ load_sockaddr:
 tcp_scan:
         ; Use ebx to track the port we're currently on, start at port 0
         xor ebx, ebx
+
         ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
         ; Scan the next set of ports
         parallel_scan:
                 ; Reset array pointer
                 mov edi, fd_array
-                ; Initiate connections in parallel for multiple sockets
+
                 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+                ; Initiate connections in parallel for multiple sockets
                 gather_sockets:
                         ; Open socket with arguments
                         ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
@@ -209,6 +213,7 @@ tcp_scan:
                         test bx, word 0x1f
                         jz wait_for_slow_connects
                         jmp gather_sockets
+
                 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
                 ; Sleep for one second in case some connections are slow
@@ -257,6 +262,7 @@ tcp_scan:
                 jmp exit
 
                 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
                 check_for_connected_sockets:
                 ; Check each file descriptor in the array for its status in
                 ; fdset_read and fdset_write, printing out the ports that are
@@ -322,7 +328,9 @@ tcp_scan:
                         sub edx, fd_array
                         cmp edx, 32
                         jne process_next_fd
+
                 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
                 close_sockets:
                 ; Close all the sockets we opened 
                 push dword 32
@@ -332,7 +340,6 @@ tcp_scan:
                 ; Quit when we've scanned ports 0-65535 
                 cmp bx, word 0
                 jne parallel_scan
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 exit:
         mov ebp, esp
         mov eax, 1
