@@ -2,9 +2,6 @@
 ; Usage: portscan [OPTIONS] HOST
 ; Author: Eugene Ma
 ; TODO: 
-;       - Implement parallel port scanning with select
-;       - Multiple hosts?
-;       - for reference? http://linux.die.net/man/1/strobe
 
 section .data
         msg_start:              db 'Scanning ports...', 10, 0
@@ -13,8 +10,10 @@ section .data
         msg_parse_err:          db 'Error: malformed IP address', 10, 0
         msg_connect_err:        db 'Error: failed to connect socket', 10, 0
         msg_connect_success:    db 'Connect succeeded!', 10, 0
-                
-        newline:                db 10, 0
+        msg_write_success:      db 'Port open!!', 10, 0
+        msg_write_fail:         db 'Write failed...', 10, 0
+        msg_port_open_start:    db 'port ', 0
+        msg_port_open_end:      db ' is open!', 10, 0
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
@@ -25,6 +24,8 @@ section .data
 
         ERRNO_EAGAIN          equ -115
         ERRNO_EINPROGRESS     equ -11
+
+        MAX_SOCKETS           equ 64 ; optimal?
         
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -51,14 +52,19 @@ section .bss
         ; } __kernel_fd_set;
         fds_write:     resb 128
         fds_read:      resb 128
-        socket_array:  resd 32 ; socket 0 - socket 31
+        socket_array:  resd MAX_SOCKETS ; socket 0 - socket MAX_SOCKET
         ; Map each socket to a port
         ; e.g. port of socket i = port_map[socket_array[i]]        
-        port_map:      resw 32 
+        port_map:      resw MAX_SOCKETS
 
         octet_buf:       resd 1
         ; For storing the port string
         port_buf:        resb 12
+
+        read_buf:       resb 256
+        read_buf_len    equ $-read_buf
+        write_buf:       resb 256
+        write_buf_len    equ $-read_buf
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -87,7 +93,7 @@ parse_octets:
         malformed_ip:
         push msg_parse_err
         call f_print_str
-        add esp, 8
+        add esp, 4
         ; Set error status to -1
         xor ebx, ebx
         not ebx
@@ -152,15 +158,6 @@ tcp_scan:
                         cmp eax, edx ; update nfds
                         cmovg edx, eax
 
-                        block_socket:
-                        push ecx ; save
-                        push edx ; save
-                        push eax 
-                        call f_block_fd
-                        pop eax
-                        pop edx
-                        pop ecx
-                
                         ; Add socket to both fdsets
                         add_to_fds:
                         push ecx ; save 
@@ -214,7 +211,7 @@ tcp_scan:
                         ; Did we "gather" enough sockets?
                         connect_ok:
                         inc word bx
-                        cmp ecx, 32 ; i.e. for (i = 0; i < 32; i++)
+                        cmp ecx, MAX_SOCKETS ; i.e. for (i = 0; i < max; i++)
                         jl gather_sockets_loop
 
                 ;------------------------------------
@@ -238,7 +235,8 @@ tcp_scan:
         
                 ; Wake up and smell the ashes...
                 ; it's time to check up on our sockets
-                call_select: ; edx/ecx are useless after this
+                call_select: 
+                inc edx ; nfds = maximum fd + 1
                 push zero_timeout
                 push dword 0
                 push dword fds_write
@@ -254,7 +252,7 @@ tcp_scan:
 
                 select_failed:
                 mov ebx, eax ; store -errno
-                push 32 ; kill all our sockets
+                push MAX_SOCKETS ; kill all our sockets
                 push socket_array
                 call f_close_socket_array
                 add esp, 8
@@ -268,55 +266,64 @@ tcp_scan:
                 ; check for the presence of each fd in fds structs
                 check_for_connected_sockets:
                 xor ecx, ecx ; reset index into socket_array
-
                 fd_loop:
                         mov eax, [socket_array + 4*ecx]
 
-                        ; Will a read block?
-                        push ecx ; save
-                        push eax
-                        push fds_read
-                        call f_fdset_check
-                        add esp, 4
-                        cmp eax, 0 ; use this for conditional jump
-                        pop eax
-                        pop ecx
-                        je next_loop
-
-                        ; Will a write block?
-                        push ecx ; save
+                        ; Check if socket is ready to be written
+                        push ecx ; save index
                         push eax
                         push fds_write
                         call f_fdset_check
-                        add esp, 8
-                        pop ecx
+                        add esp, 4
                         cmp eax, 0
-                        je next_loop
+                        pop eax
+                        pop ecx
+                        je check_next_socket ; port was FILTERED
+
+                        ; Try to send a zero byte
+                        write_ready:
+                        push ecx ; save
+                        push dword 0
+                        push write_buf
+                        push eax
+                        call f_write_fd
+                        add esp, 12
+                        pop ecx
+
+                        ; Write failed! Port was CLOSED 
+                        test eax, eax
+                        js check_next_socket
                         
                         ; if we reach here, we found an open port!
                         print_port:
-                        push ecx ; save
-                        movzx edx, word [port_map + 2*ecx]
-                        push dword port_buf
-                        push edx
-                        call f_ultostr
-                        add esp, 4
-                        call f_print_str
-                        mov [esp], dword newline ; swap buffer
-                        call f_print_str
-                        add esp, 4
-                        pop ecx
+                        push ecx ; save index
 
-                        next_loop:
+                        movzx edx, word [port_map + 2*ecx]
+                        push port_buf
+                        push edx
+                        call f_ultostr ; convert port to string
+                        add esp, 8
+                        
+                        push msg_port_open_start ; "Port " ...
+                        call f_print_str
+                        mov [esp], dword port_buf 
+                        call f_print_str ; %s = port
+                        mov [esp], dword msg_port_open_end 
+                        call f_print_str ; ..." is open!\n"
+                        add esp, 4
+
+                        pop ecx ; restore index
+
+                        check_next_socket:
                         inc ecx
-                        cmp ecx, 32
+                        cmp ecx, MAX_SOCKETS
                         jl fd_loop
 
                 ;------------------------------------
 
                 ; close all the sockets we opened 
                 free_sockets:
-                push dword 32
+                push dword MAX_SOCKETS
                 push socket_array
                 call f_close_socket_array
                 add esp, 8
@@ -792,6 +799,7 @@ f_load_sockaddr:
 f_block_fd:
         push ebp
         mov ebp, esp
+        push ebx
                 
         mov eax, 55 ; fcntl
         mov ebx, [ebp+8]
@@ -800,6 +808,45 @@ f_block_fd:
         not edx ; ~O_NONBLOCK
         int 0x80
 
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; f_read_fd - read from file
+;       expects: fd, buffer, buffer len
+;       returns: number of bytes read, or -errno
+f_read_fd:
+        push ebp
+        mov ebp, esp
+        push ebx
+
+        mov eax, 3
+        mov ebx, [ebp+8]
+        mov ecx, [ebp+12]
+        mov edx, [ebp+14]
+        int 0x80
+
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; f_write_fd - write to file
+;       expects: fd, buffer, buffer len
+;       returns: number of bytes written, or -errno
+f_write_fd:
+        push ebp
+        mov ebp, esp
+        push ebx
+
+        mov eax, 4
+        mov ebx, [ebp+8]
+        mov ecx, [ebp+12]
+        mov edx, [ebp+14]
+        int 0x80
+
+        pop ebx
         mov esp, ebp
         pop ebp
         ret
