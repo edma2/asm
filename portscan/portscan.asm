@@ -12,9 +12,8 @@ section .data
         msg_parse_err:          db 'error: Malformed IP address', 10, 0
         msg_connect_err:        db 'error: Unexpected sys_connect errno', 10, 0
 
-        ; "Port %s is open!" 
-        msg_port_open_start:    db 'Port ', 0
-        msg_port_open_end:      db ' is open!', 10, 0
+        ; "%s OPEN"
+        msg_port_open:      db ' OPEN', 10, 0
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
@@ -305,12 +304,10 @@ tcp_scan:
                         push edx
                         call ultostr 
                         add esp, 8
-                        ; "Port %s is open!"
-                        push msg_port_open_start 
-                        call printstr
-                        mov [esp], dword portstr 
+                        ; "%s OPEN"
+                        push dword portstr 
                         call printstr 
-                        mov [esp], dword msg_port_open_end 
+                        mov [esp], dword msg_port_open
                         call printstr
                         add esp, 4
 
