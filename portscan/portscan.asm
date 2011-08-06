@@ -52,13 +52,12 @@ section .bss
         ; } __kernel_fd_set;
         writefds:       resb 128
         
-        socket_array:   resd MAX_SOCKETS ; socket_0 ... socket_max
+        sockets:        resd MAX_SOCKETS ; socket_0 ... socket_max
         ; Map each socket to a port
-        ; e.g. port of socket i = port_map[socket_array[i]]        
-        port_map:       resw MAX_SOCKETS
-
-        octet_buf:      resd 1  ; temporary storage for octets
-        port_buf:       resb 12 ; for port to string conversion 
+        ; e.g. port of socket i = portsmap[sockets[i]]        
+        portsmap:       resw MAX_SOCKETS
+        octets:         resd 1  ; temporary storage for octets
+        portstr:        resb 12 ; for port to string conversion 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -72,7 +71,7 @@ _start:
 
 parse_octets:
         ; Parse the ip string into octets 
-        push octet_buf             
+        push octets             
         push dword [ebp+8]   
         call parseip
         add esp, 8
@@ -102,7 +101,7 @@ load_struct_sockaddr:
         xor ax, ax
         stosw
         ; sin_addr
-        mov eax, [octet_buf]
+        mov eax, [octets]
         stosd
         ; padding
         xor eax, eax
@@ -115,7 +114,7 @@ tcp_scan:
         xor ebx, ebx 
         max_parallel_sockets_loop: 
                 ; Scan another round of ports
-                ; Reset index into socket_array, port_map
+                ; Reset index into sockets, portsmap
                 xor esi, esi 
                 ; Store nfds (= 1 + maximum fd) for sys_select
                 xor edi, edi 
@@ -143,7 +142,7 @@ tcp_scan:
                         ; We should close(3) all our open sockets
                         ; esi should contain count of open sockets
                         push esi
-                        push socket_array
+                        push sockets
                         call killsockets
                         add esp, 8
                         ; Print socket error message and exit(3)
@@ -158,8 +157,8 @@ tcp_scan:
 
                         save_socket:
                         ; Socket seems good, save it to our array and map the port 
-                        mov [socket_array + 4 * esi], eax 
-                        mov [port_map + 2 * esi], word bx 
+                        mov [sockets + 4 * esi], eax 
+                        mov [portsmap + 2 * esi], word bx 
                         inc esi
                         ; Update nfds: max(nfds, fd)
                         cmp eax, edi
@@ -198,7 +197,7 @@ tcp_scan:
                         ; Save -errno on stack
                         push eax 
                         push esi
-                        push socket_array
+                        push sockets
                         call killsockets
                         add esp, 8
                         push msg_connect_err
@@ -254,7 +253,7 @@ tcp_scan:
                 ; Save -errno on stack and kill all sockets
                 push eax
                 push MAX_SOCKETS
-                push socket_array
+                push sockets
                 call killsockets
                 add esp, 8
                 push msg_select_err
@@ -269,12 +268,12 @@ tcp_scan:
 
                 check_for_connected_sockets:
                 ; Check for the presence of each socket in writefds
-                ; Reset index into socket_array
+                ; Reset index into sockets
                 xor esi, esi
                 fd_loop:
                         check_fds:
                         ; Fetch file descriptor
-                        mov eax, [socket_array + 4 * esi]
+                        mov eax, [sockets + 4 * esi]
                         push eax
                         push writefds
                         call fdisset
@@ -301,15 +300,15 @@ tcp_scan:
                         print_port:
                         ; We found an open port!
                         ; Convert the port number to a printable string
-                        movzx edx, word [port_map + 2 * esi]
-                        push port_buf
+                        movzx edx, word [portsmap + 2 * esi]
+                        push portstr
                         push edx
                         call ultostr 
                         add esp, 8
                         ; "Port %s is open!"
                         push msg_port_open_start 
                         call printstr
-                        mov [esp], dword port_buf 
+                        mov [esp], dword portstr 
                         call printstr 
                         mov [esp], dword msg_port_open_end 
                         call printstr
@@ -328,7 +327,7 @@ tcp_scan:
                 free_sockets:
                 ; Kill all the sockets we opened 
                 push dword MAX_SOCKETS
-                push socket_array
+                push sockets
                 call killsockets
                 add esp, 8
                 ; Check to see if we're done
@@ -344,6 +343,50 @@ exit:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; printstr - print a string to standard output
+;       expects: string address
+;       returns: bytes written in eax, -errno on error
+printstr:
+        push ebp
+        mov ebp, esp
+        
+        push dword [ebp+8]
+        call strlen
+        add esp, 4
+        
+        push eax
+        push dword [ebp+8]
+        push dword 1
+        call sys_write
+        add esp, 12
+
+        mov esp, ebp
+        pop ebp
+        ret
+
+; strlen - calculate the length of null-terminated string
+;       expects: string address
+;       returns: length in eax
+strlen:
+        push ebp     
+        mov ebp, esp
+        push edi
+
+        cld     
+        xor eax, eax
+        xor ecx, ecx
+        not ecx
+        mov edi, [ebp+8]
+        repne scasb
+        
+        not ecx
+        lea eax, [ecx-1]
+        
+        pop edi
+        mov esp, ebp
+        pop ebp
+        ret
 
 ; parseip - convert IPv4 address from text to binary form
 ;       expects: ip string, destination buffer
@@ -532,50 +575,6 @@ ultostr:
 
         pop edi
         pop esi
-        mov esp, ebp
-        pop ebp
-        ret
-
-; printstr - print a string to standard output
-;       expects: string address
-;       returns: bytes written in eax, -errno on error
-printstr:
-        push ebp
-        mov ebp, esp
-        
-        push dword [ebp+8]
-        call strlen
-        add esp, 4
-        
-        push eax
-        push dword [ebp+8]
-        push dword 1
-        call sys_write
-        add esp, 12
-
-        mov esp, ebp
-        pop ebp
-        ret
-
-; strlen - calculate the length of null-terminated string
-;       expects: string address
-;       returns: length in eax
-strlen:
-        push ebp     
-        mov ebp, esp
-        push edi
-
-        cld     
-        xor eax, eax
-        xor ecx, ecx
-        not ecx
-        mov edi, [ebp+8]
-        repne scasb
-        
-        not ecx
-        lea eax, [ecx-1]
-        
-        pop edi
         mov esp, ebp
         pop ebp
         ret
