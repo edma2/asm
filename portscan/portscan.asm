@@ -19,7 +19,7 @@ section .data
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
         ; }; 
-        timeval_1s:             dd 1, 0
+        timeval_1s:             dd 0, 400000
         timeval_0s:             dd 0, 0
 
         ERRNO_EAGAIN            equ -115
@@ -225,7 +225,7 @@ tcp_scan:
                 call sys_select
                 add esp, 20
                 ; Linux select(3) will mangle timeval structs
-                mov [timeval_1s], dword 1
+                mov [timeval_1s+4], dword 200000
         
                 call_select: 
                 ; Wake up and smell the ashes...
