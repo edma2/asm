@@ -11,6 +11,7 @@ section .data
         msg_select_err:         db 'error: sys_select failed', 10, 0
         msg_parse_err:          db 'error: Malformed IP address', 10, 0
         msg_connect_err:        db 'error: Unexpected sys_connect errno', 10, 0
+
         ; "Port %s is open!" 
         msg_port_open_start:    db 'Port ', 0
         msg_port_open_end:      db ' is open!', 10, 0
@@ -73,33 +74,40 @@ parse_octets:
         ; Parse the ip string into octets 
         push octet_buf             
         push dword [ebp+8]   
-        call f_parse_ip
+        call parseip
         add esp, 8
         
         ; Check the return value
         test eax, eax
         js malformed_ip
-        jmp load_sockaddr
+        jmp load_struct_sockaddr
 
         ; Print error message and exit
         malformed_ip:
         push msg_parse_err
-        call f_print_str
+        call printstr
         add esp, 4
         ; Set error status to -1
         xor ebx, ebx
         not ebx
         jmp exit
 
-load_sockaddr:
-        ; Load the struct sockaddr 
-        push dword [octet_buf]
-        ; The port changes dynamically
-        ; Zero it out for now
-        push dword 0
-        push sockaddr
-        call f_load_sockaddr    
-        add esp, 12
+load_struct_sockaddr:
+        mov edi, sockaddr
+        cld            
+        ; sin_family = AF_INET
+        mov ax, word 2   
+        stosw           
+        ; sin_port = 0
+        xor ax, ax
+        stosw
+        ; sin_addr
+        mov eax, [octet_buf]
+        stosd
+        ; padding
+        xor eax, eax
+        mov ecx, 2
+        rep stosd
 
 tcp_scan:
         ; cdecl: ebx/esi/edi should always be perserved by the callee
@@ -114,13 +122,12 @@ tcp_scan:
                 gather_sockets_loop:
                         spawn_socket:
                         ; "Gather" sockets one by one using socket(3) and connect(3)
-                        ; Save important registers (index and nfds)
                         ; Call sys_socket with arguments
                         ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
                         push dword 6 
                         push dword (1 | 4000q) 
                         push dword 2 
-                        call f_socket
+                        call sys_socket
                         add esp, 12
 
                         ; Check return value
@@ -137,11 +144,11 @@ tcp_scan:
                         ; esi should contain count of open sockets
                         push esi
                         push socket_array
-                        call f_close_socket_array
+                        call killsockets
                         add esp, 8
-                        ; Print socket error message and exit(2)
+                        ; Print socket error message and exit(3)
                         push msg_sock_err
-                        call f_print_str
+                        call printstr
                         add esp, 4
                         ; Save errno in ebx
                         pop ebx 
@@ -154,14 +161,14 @@ tcp_scan:
                         mov [socket_array + 4 * esi], eax 
                         mov [port_map + 2 * esi], word bx 
                         inc esi
-                        ; Update nfds
+                        ; Update nfds: max(nfds, fd)
                         cmp eax, edi
                         cmovg edi, eax
                         ; Add socket to writefds
                         writefds_set:
                         push eax
                         push writefds
-                        call f_fds_set
+                        call fdset
                         add esp, 4
                         pop eax 
 
@@ -173,7 +180,7 @@ tcp_scan:
                         push sockaddrlen
                         push sockaddr        
                         push eax 
-                        call f_connect
+                        call sys_connect
                         add esp, 12
         
                         check_errno:
@@ -192,10 +199,10 @@ tcp_scan:
                         push eax 
                         push esi
                         push socket_array
-                        call f_close_socket_array
+                        call killsockets
                         add esp, 8
                         push msg_connect_err
-                        call f_print_str
+                        call printstr
                         add esp, 4
                         pop ebx
                         not ebx
@@ -217,7 +224,7 @@ tcp_scan:
                 push dword 0
                 push dword 0
                 push dword 0
-                call f_select
+                call sys_select
                 add esp, 20
                 ; Linux select(3) will mangle timeval structs
                 mov [timeval_1s], dword 1
@@ -225,14 +232,14 @@ tcp_scan:
                 call_select: 
                 ; Wake up and smell the ashes...
                 ; Time to check up on our sockets
-                ; nfds = maximum fd + 1
                 push timeval_0s
                 push dword 0
                 push dword writefds
                 push dword 0
+                ; nfds = maximum fd + 1
                 inc edi 
                 push edi
-                call f_select
+                call sys_select
                 add esp, 20
 
                 cmp eax, 0
@@ -248,10 +255,10 @@ tcp_scan:
                 push eax
                 push MAX_SOCKETS
                 push socket_array
-                call f_close_socket_array
+                call killsockets
                 add esp, 8
                 push msg_select_err
-                call f_print_str
+                call printstr
                 add esp, 4
                 pop ebx
                 not ebx
@@ -270,7 +277,7 @@ tcp_scan:
                         mov eax, [socket_array + 4 * esi]
                         push eax
                         push writefds
-                        call f_fdset_check
+                        call fdisset
                         add esp, 4
                         cmp eax, 0
                         pop eax
@@ -284,7 +291,7 @@ tcp_scan:
                         push dword 0
                         push dword 0
                         push eax
-                        call f_write_fd
+                        call sys_write
                         add esp, 12 
                         test eax, eax
                         ; There was an error in writing
@@ -297,15 +304,15 @@ tcp_scan:
                         movzx edx, word [port_map + 2 * esi]
                         push port_buf
                         push edx
-                        call f_ultostr 
+                        call ultostr 
                         add esp, 8
                         ; "Port %s is open!"
                         push msg_port_open_start 
-                        call f_print_str
+                        call printstr
                         mov [esp], dword port_buf 
-                        call f_print_str 
+                        call printstr 
                         mov [esp], dword msg_port_open_end 
-                        call f_print_str
+                        call printstr
                         add esp, 4
 
                         ; TODO: add failed ports to arrays/sets?
@@ -322,7 +329,7 @@ tcp_scan:
                 ; Kill all the sockets we opened 
                 push dword MAX_SOCKETS
                 push socket_array
-                call f_close_socket_array
+                call killsockets
                 add esp, 8
                 ; Check to see if we're done
                 cmp bx, word 1024 
@@ -338,10 +345,10 @@ exit:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-; f_parse_ip - convert IPv4 address from text to binary form
+; parseip - convert IPv4 address from text to binary form
 ;       expects: ip string, destination buffer
 ;       returns: 0 in eax, ~0 on error
-f_parse_ip:
+parseip:
         push ebp
         mov ebp, esp
         sub esp, 4
@@ -387,7 +394,7 @@ f_parse_ip:
                 mov [edi], byte 0
                 ; The argument we need is already on the stack, it points to
                 ; the first byte of the octet string
-                call f_strtoul
+                call strtoul
                 ; An octet has to be an 8-bit value
                 cmp eax, 255
                 jg invalid_ip
@@ -432,10 +439,10 @@ f_parse_ip:
         pop ebp
         ret
 
-; f_strtoul - convert a number from text to binary form
+; strtoul - convert a number from text to binary form
 ;       expects: string address
 ;       returns: 32-bit unsigned integer in eax
-f_strtoul:
+strtoul:
         push ebp
         mov ebp, esp
 
@@ -460,10 +467,10 @@ f_strtoul:
         pop ebp
         ret
 
-; f_ultostr - convert an unsigned integer to a C string
+; ultostr - convert an unsigned integer to a C string
 ;       expects: 32-bit unsigned integer, buffer 
 ;       returns: nothing
-f_ultostr:
+ultostr:
         push ebp  
         mov ebp, esp
         push esi
@@ -529,49 +536,31 @@ f_ultostr:
         pop ebp
         ret
 
-; f_write_stdout - write buffer to standard output
-;       expects: buffer, length
-;       returns: bytes written in eax, -errno on error
-f_write_stdout:
-        push ebp
-        mov ebp, esp
-        push ebx
-        
-        mov eax, 4
-        mov ebx, 1
-        mov ecx, [ebp+8]   
-        mov edx, [ebp+12]   
-        int 0x80
-        
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret
-
-; f_print_str - print a string to standard output
+; printstr - print a string to standard output
 ;       expects: string address
 ;       returns: bytes written in eax, -errno on error
-f_print_str:
+printstr:
         push ebp
         mov ebp, esp
         
         push dword [ebp+8]
-        call f_strlen
+        call strlen
         add esp, 4
         
         push eax
         push dword [ebp+8]
-        call f_write_stdout
-        add esp, 8
+        push dword 1
+        call sys_write
+        add esp, 12
 
         mov esp, ebp
         pop ebp
         ret
 
-; f_strlen - calculate the length of null-terminated string
+; strlen - calculate the length of null-terminated string
 ;       expects: string address
 ;       returns: length in eax
-f_strlen:
+strlen:
         push ebp     
         mov ebp, esp
         push edi
@@ -591,94 +580,7 @@ f_strlen:
         pop ebp
         ret
 
-; f_close - close a file descriptor
-;       expects: file descriptor
-;       returns: 0 in eax | -errno in eax if error
-f_close:
-        push ebp
-        mov ebp, esp
-        push ebx
-        
-        mov eax, 6
-        mov ebx, [ebp+8]
-        int 0x80
-        
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret
-
-; f_connect - connect a socket       
-;       expects: int socket, address, address length
-;       returns: 0 in eax or -errno on error
-f_connect:
-        push ebp
-        mov ebp, esp
-        push ebx
-        push edi
-
-        mov eax, 102
-        mov ebx, 3
-        ; sys_socketcall is a wrapper around all the socket system calls, and
-        ; takes as an argument a pointer to the arguments specific to the
-        ; socket call we want to use, so load ecx with the address of the first
-        ; argument on the stack
-        lea ecx, [ebp+8]
-        int 0x80
-
-        pop edi
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret
-
-; f_socket - create a socket       
-;       expects: int domain, int type, int protocol
-;       returns: 0 in eax or -errno on error
-f_socket:
-        push ebp
-        mov ebp, esp
-        push ebx
-        push edi
-
-        mov eax, 102
-        mov ebx, 1
-        lea ecx, [ebp+8]
-        int 0x80
-
-        pop edi
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret
-
-; f_select - wrapper around sys_select
-;       expects: int nfds, fd_set *readfds, fd_set *writefds,
-;                fd_set *exceptfds, struct timeval *timeout
-;       returns: total number of fildes set in fd_set structs, -errno if error
-f_select:
-        push ebp
-        mov ebp, esp
-        push ebx
-        push esi
-        push edi
-
-        mov eax, 142
-        mov ebx, [ebp+8]
-        mov ecx, [ebp+12]
-        mov edx, [ebp+16]
-        mov esi, [ebp+20]
-        mov edi, [ebp+24]
-        int 0x80
-
-        pop edi
-        pop esi
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret
-
-; f_fds_set - add a file descriptor to struct fd_set
+; fdset - add a file descriptor to struct fd_set
 ;       expects: pointer to struct fd_set, fd
 ;       returns: nothing
 ;
@@ -687,7 +589,7 @@ f_select:
 ; select(2). struct fd_set is implemented as a bit array, composed of 32-bit
 ; ints, and every possible file descriptor is mapped to a bit position.
 ; e.g. (31|30|29|...|1|0) (63|62|61|...|33|32) ...
-f_fds_set:
+fdset:
         push ebp
         mov ebp, esp
 
@@ -714,10 +616,10 @@ f_fds_set:
         pop ebp
         ret
 
-; f_fdset_check - check if a file descriptor is present in fd_set
+; fdisset - check if a file descriptor is present in fd_set
 ;       expects: pointer to struct fd_set, fd
 ;       returns: 1 in eax, 0 otherwise
-f_fdset_check:
+fdisset:
         push ebp
         mov ebp, esp
 
@@ -739,10 +641,10 @@ f_fdset_check:
         pop ebp
         ret
 
-; f_close_socket_array - close first n fildes in the array 
+; killsockets - close first n fd in the socket array 
 ;       expects: array, n
 ;       returns: nothing
-f_close_socket_array:
+killsockets:
         push ebp
         mov ebp, esp
 
@@ -753,7 +655,7 @@ f_close_socket_array:
         lodsd 
         ; next fd in eax
         push eax
-        call f_close
+        call sys_close
         add esp, 4
         dec ecx
         jnz close_loop
@@ -762,60 +664,10 @@ f_close_socket_array:
         pop ebp
         ret
 
-; f_load_sockaddr - load the struct sockaddr 
-;       expects: pointer to struct sockaddr, port, octets
-;       returns: nothing
-;       note: port and octets must be in network byte order.
-f_load_sockaddr:
-        push ebp
-        mov ebp, esp
-        push edi
-        
-        mov edi, [ebp+8]
-        cld            
-        ; sin_family = AF_INET
-        mov ax, word 2   
-        stosw           
-        ; sin_port
-        mov ax, word [ebp+12]
-        stosw
-        ; sin_addr
-        mov eax, [ebp+16]
-        stosd
-        ; padding
-        xor eax, eax
-        mov ecx, 2
-        rep stosd
-
-        pop edi
-        mov esp, ebp
-        pop ebp
-        ret
-
-; f_block_fd - block a previously unblocked file descriptor
-;       expects: fd
-;       returns: >= 0 if successful, -errno otherwise
-f_block_fd:
-        push ebp
-        mov ebp, esp
-        push ebx
-                
-        mov eax, 55 ; fcntl
-        mov ebx, [ebp+8]
-        mov ecx, 4 ; F_SETFL
-        mov edx, 4000q
-        not edx ; ~O_NONBLOCK
-        int 0x80
-
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret
-
-; f_read_fd - read from file
+; sys_read - read from file
 ;       expects: fd, buffer, buffer len
 ;       returns: number of bytes read, or -errno
-f_read_fd:
+sys_read:
         push ebp
         mov ebp, esp
         push ebx
@@ -831,10 +683,10 @@ f_read_fd:
         pop ebp
         ret
 
-; f_write_fd - write to file
+; sys_write - write to file
 ;       expects: fd, buffer, buffer len
 ;       returns: number of bytes written, or -errno
-f_write_fd:
+sys_write:
         push ebp
         mov ebp, esp
         push ebx
@@ -842,9 +694,96 @@ f_write_fd:
         mov eax, 4
         mov ebx, [ebp+8]
         mov ecx, [ebp+12]
-        mov edx, [ebp+14]
+        mov edx, [ebp+16]
         int 0x80
 
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; sys_close - close a file descriptor
+;       expects: file descriptor
+;       returns: 0 in eax | -errno in eax if error
+sys_close:
+        push ebp
+        mov ebp, esp
+        push ebx
+        
+        mov eax, 6
+        mov ebx, [ebp+8]
+        int 0x80
+        
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; sys_connect - connect a socket       
+;       expects: int socket, address, address length
+;       returns: 0 in eax or -errno on error
+sys_connect:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push edi
+
+        mov eax, 102
+        mov ebx, 3
+        ; sys_socketcall is a wrapper around all the socket system calls, and
+        ; takes as an argument a pointer to the arguments specific to the
+        ; socket call we want to use, so load ecx with the address of the first
+        ; argument on the stack
+        lea ecx, [ebp+8]
+        int 0x80
+
+        pop edi
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; sys_socket - create a socket       
+;       expects: int domain, int type, int protocol
+;       returns: 0 in eax or -errno on error
+sys_socket:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push edi
+
+        mov eax, 102
+        mov ebx, 1
+        lea ecx, [ebp+8]
+        int 0x80
+
+        pop edi
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; sys_select - wrapper around sys_select
+;       expects: int nfds, fd_set *readfds, fd_set *writefds,
+;                fd_set *exceptfds, struct timeval *timeout
+;       returns: total number of fildes set in fd_set structs, -errno if error
+sys_select:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+
+        mov eax, 142
+        mov ebx, [ebp+8]
+        mov ecx, [ebp+12]
+        mov edx, [ebp+16]
+        mov esi, [ebp+20]
+        mov edi, [ebp+24]
+        int 0x80
+
+        pop edi
+        pop esi
         pop ebx
         mov esp, ebp
         pop ebp
