@@ -1,0 +1,8 @@
+portscan
+by Eugene Ma
+===================
+A port scanner that implements the TCP connect(2) scanning method using
+multiple sockets in parallel to achieve fast scan rates (approximately 100
+ports per second). Written entirely in 32-bit x86 assembly (NASM). 
+portscan was written primarily for educational benefit, but may be fast, and is
+at least comparable to nmap speeds. 
