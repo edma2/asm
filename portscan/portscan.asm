@@ -1,36 +1,27 @@
 ; vim: ft=nasm
 ; Usage: portscan [OPTIONS] HOST
 ; Author: Eugene Ma
-; TODO: 
-;       - maintain a list of open/closed/filtered ports?
-;       - process ports from an array instead of counter
-;       - store sockets in a "master fds" bitfield instead of array?
-;       - dynamically adjust timeout?
 
 section .data
-        msg_sock_err:           db 'error: sys_socket failed', 10, 0
-        msg_select_err:         db 'error: sys_select failed', 10, 0
-        msg_parse_err:          db 'error: Malformed IP address', 10, 0
-        msg_connect_err:        db 'error: Unexpected connect error', 10, 0
-
-        ; "%s OPEN"
-        msg_port_open:          db ' OPEN', 10, 0
-
-        msg_open:               db ' open ', 0
-        msg_filtered:           db ' filtered ', 0
-        msg_closed:             db ' closed', 10, 0
+        socket_error_msg:       db 'error: sys_socket failed', 10, 0
+        select_error_msg:       db 'error: sys_select failed', 10, 0
+        parse_error_msg:        db 'error: Malformed IP address', 10, 0
+        connect_error_msg:      db 'error: Unexpected connect error', 10, 0
+        newline_msg:            db 10, 0
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
         ; }; 
-        timeval_1s:             dd 0, 500000
+        timeval_1s:             dd 0, 400000
         timeval_0s:             dd 0, 0
 
-        ERRNO_EAGAIN            equ -115
-        ERRNO_EINPROGRESS       equ -11
-        MAX_SOCKETS             equ 64 ; optimal?
-        
+        errno_eagain            equ -115
+        errno_einprogress       equ -11
+        max_parallel_sockets             equ 64
+
+        ;icmp_header:            db: 
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -45,8 +36,6 @@ section .bss
         sockaddr:       resb 16
         sockaddrlen     equ (2+2+4+8)
 
-        ; Defined in /include/linux/posix_types.h
-        ;
         ; #define __NFDBITS (8 * sizeof(unsigned long))  // bits per file descriptor
         ; #define __FD_SETSIZE 1024                      // bits per fd_set
         ; #define __FDSET_LONGS (__FD_SETSIZE/__NFDBITS) // ints per fd_set
@@ -56,16 +45,14 @@ section .bss
         ; } __kernel_fd_set;
         writefds:       resb 128
         
-        sockets:        resd MAX_SOCKETS ; socket_0 ... socket_max
-        ; Map each socket to a port
-        ; e.g. port of socket i = portsmap[sockets[i]]        
-        portsmap:       resw MAX_SOCKETS
-        octets:         resd 1  ; temporary storage for octets
-        portstr:        resb 12 ; for port to string conversion 
-
-        ports_open:     resd 1
-        ports_filtered: resd 1
-        ports_closed:   resd 1
+        ; Where socket fds live
+        sockets:        resd max_parallel_sockets 
+        ; Map each socket to a port (e.g. port of socket i = portsmap[sockets[i]])        
+        portsmap:       resw max_parallel_sockets
+        ; Put octets here after parsing
+        octets:         resd 1 
+        ; For port to string conversion 
+        portstr:        resb 12 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -77,11 +64,11 @@ section .text
 _start:
         mov ebp, esp
 
-parse_octets:
+parse_string_to_octets:
         ; Parse the ip string into octets 
         push octets             
         push dword [ebp+8]   
-        call parseip
+        call parse_octets
         add esp, 8
         
         ; Check the return value
@@ -91,7 +78,7 @@ parse_octets:
 
         ; Print error message and exit
         malformed_ip:
-        push msg_parse_err
+        push parse_error_msg
         call printstr
         add esp, 4
         ; Set error status to -1
@@ -99,176 +86,122 @@ parse_octets:
         not ebx
         jmp exit
 
+ping_host:
+        ; We do this to minimize the timeout required to wait for TCP
+        ; connections. Called with arguments:
+        ; PF_INET, SOCK_RAW, IPPROTO_ICMP
+        push dword 6 
+        push dword 3
+        push dword 1 
+        call sys_socket
+        add esp, 12
+
 load_struct_sockaddr:
         mov edi, sockaddr
         cld            
         ; sin_family = AF_INET
-        mov ax, word 2   
+        mov ax, word 2 
         stosw           
-        ; sin_port = 0
-        xor ax, ax
-        stosw
-        ; sin_addr
+        ; Fill in the port later (sin_port)
+        add edi, 2
+        ; sin_addr 
         mov eax, [octets]
         stosd
-        ; padding
+        ; Fill padding
         xor eax, eax
-        mov ecx, 2
+        rep stosd
         rep stosd
 
-tcp_scan:
-        ; cdecl: ebx/esi/edi should always be perserved by the callee
-        ; Scan ports 0-1023, last port always stored in ebx
-        xor ebx, ebx 
-        parallel_scan_loop: 
-                ; Scan MAX_SOCKETS ports in parallel in each iteration
-                ; Reset index into sockets, portsmap
-                xor esi, esi 
-                ; Store nfds (= 1 + maximum fd) for sys_select
-                xor edi, edi 
-                gather_sockets:
-                        ; "Gather" sockets one by one using socket(3) and connect(3)
-                        spawn_socket:
-                        ; Call sys_socket with arguments
-                        ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
-                        push dword 6 
-                        push dword (1 | 4000q) 
-                        push dword 2 
-                        call sys_socket
-                        add esp, 12
+; Scan ports 0-1023, last port always stored in ebx
+; cdecl: ebx/esi/edi should always be perserved by the callee
+xor ebx, ebx 
+tcp_scan: 
+        ; Reset index into sockets, portsmap
+        xor esi, esi 
+        ; Store nfds (= 1 + maximum fd) for sys_select
+        xor edi, edi 
+        gather_sockets:
+                ; "Gather" sockets one by one using socket(3) and connect(3)
+                spawn_socket:
+                ; Call sys_socket with arguments
+                ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
+                push dword 6 
+                push dword (1 | 4000q) 
+                push dword 2 
+                call sys_socket
+                add esp, 12
 
-                        ; Check return value
-                        test eax, eax
-                        ; sys_socket failed with -errno
-                        js socket_create_error 
-                        jmp save_socket
+                ; Check return value
+                test eax, eax
+                ; sys_socket failed with -errno
+                js socket_create_error 
+                jmp save_socket
 
-                        socket_create_error:
-                        ; We had trouble creating the socket
-                        ; Save -errno on stack
-                        push eax 
-                        ; We should close(3) all our open sockets
-                        ; esi should contain count of open sockets
-                        push esi
-                        push sockets
-                        call killsockets
-                        add esp, 8
-                        ; Print socket error message and exit(3)
-                        push msg_sock_err
-                        call printstr
-                        add esp, 4
-                        ; Save errno in ebx
-                        pop ebx 
-                        not ebx
-                        inc ebx
-                        jmp exit
-
-                        save_socket:
-                        ; Socket seems good, save it to our array and map the port 
-                        mov [sockets + 4 * esi], eax 
-                        mov [portsmap + 2 * esi], word bx 
-                        inc esi
-                        ; Update nfds: max(nfds, fd)
-                        cmp eax, edi
-                        cmovg edi, eax
-                        ; Add socket to writefds
-                        writefds_set:
-                        push eax
-                        push writefds
-                        call fdset
-                        add esp, 4
-                        pop eax 
-
-                        connect_socket:
-                        ; Initiate TCP handshake to port
-                        ; Load port to sockaddr struct in htons() order
-                        mov [sockaddr+2], byte bh 
-                        mov [sockaddr+3], byte bl 
-                        push sockaddrlen
-                        push sockaddr        
-                        push eax 
-                        call sys_connect
-                        add esp, 12
-        
-                        check_errno:
-                        ; We expect to see EAGAIN or EINPROGRESS
-                        cmp eax, ERRNO_EAGAIN
-                        je connect_ok
-                        cmp eax, ERRNO_EINPROGRESS
-                        je connect_ok
-                        cmp eax, 0
-                        ; This would be very unexpected!
-                        je connect_ok
-
-                        wrong_errno:
-                        ; Connect failed for reasons other than being "in progress"
-                        ; Save -errno on stack
-                        push eax 
-                        push esi
-                        push sockets
-                        call killsockets
-                        add esp, 8
-                        push msg_connect_err
-                        call printstr
-                        add esp, 4
-                        pop ebx
-                        not ebx
-                        inc ebx
-                        jmp exit
-
-                        connect_ok:
-                        ; "Gather" next socket-port combination or proceed to next step
-                        inc word bx
-                        cmp esi, MAX_SOCKETS
-                        jl gather_sockets
-        
-                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-                wait_for_connects:
-                ; We should timeout to wait for connections
-                push timeval_1s
-                push dword 0
-                push dword 0
-                push dword 0
-                push dword 0
-                call sys_select
-                add esp, 20
-                ; Linux select(3) will mangle timeval structs
-                mov [timeval_1s+4], dword 500000
-        
-                call_select: 
-                ; Wake up and smell the ashes...
-                ; Time to check up on our sockets
-                push timeval_0s
-                push dword 0
-                push dword writefds
-                push dword 0
-                ; nfds = maximum fd + 1
-                inc edi 
-                push edi
-                call sys_select
-                add esp, 20
-
-                cmp eax, 0
-                ; sys_select returned -errno
-                js select_failed 
-                ; No sockets were ready for writing
-                je blocked 
-                ; Otherwise, eax stores number of file descriptors ready for writing
-                jmp check_for_connected_sockets 
-
-                blocked:
-                add [ports_filtered], dword MAX_SOCKETS
-                jmp free_sockets
-
-                select_failed:
-                ; Save -errno on stack and kill all sockets
-                push eax
-                push MAX_SOCKETS
+                socket_create_error:
+                ; We had trouble creating the socket
+                ; Save -errno on stack
+                push eax 
+                ; We should close(3) all our open sockets
+                ; esi should contain count of open sockets
+                push esi
                 push sockets
-                call killsockets
+                call kill_sockets
                 add esp, 8
-                push msg_select_err
+                ; Print socket error message and exit(3)
+                push socket_error_msg
+                call printstr
+                add esp, 4
+                ; Save errno in ebx
+                pop ebx 
+                not ebx
+                inc ebx
+                jmp exit
+
+                save_socket:
+                ; Socket seems good, save it to our array and map the port 
+                mov [sockets + 4 * esi], eax 
+                mov [portsmap + 2 * esi], word bx 
+                inc esi
+                ; Update nfds: max(nfds, fd)
+                cmp eax, edi
+                cmovg edi, eax
+                ; Add socket to writefds
+                push eax
+                push writefds
+                call fdset
+                add esp, 4
+                pop eax 
+
+                attempt_connect:
+                ; Initiate TCP handshake to port
+                ; Load port to sockaddr struct in htons() order
+                mov [sockaddr+2], byte bh 
+                mov [sockaddr+3], byte bl 
+                push sockaddrlen
+                push sockaddr        
+                push eax 
+                call sys_connect
+                add esp, 12
+
+                check_errno:
+                ; We expect to see EAGAIN or EINPROGRESS
+                cmp eax, errno_eagain
+                je connect_in_progress
+                cmp eax, errno_einprogress
+                je connect_in_progress
+                cmp eax, 0
+                ; This would be very unexpected!
+                je connect_complete
+
+                wrong_errno:
+                ; Connect failed for reasons other than being "in progress"
+                ; Save -errno on stack
+                push eax 
+                push esi
+                push sockets
+                call kill_sockets
+                add esp, 8
+                push connect_error_msg
                 call printstr
                 add esp, 4
                 pop ebx
@@ -276,103 +209,130 @@ tcp_scan:
                 inc ebx
                 jmp exit
 
-                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                connect_complete:
+                connect_in_progress:
+                ; "Gather" next socket-port combination or proceed to next step
+                inc word bx
+                cmp esi, max_parallel_sockets
+                jl gather_sockets
 
-                check_for_connected_sockets:
-                ; Check for the presence of each socket in writefds
-                ; Reset index into sockets
-                xor esi, esi
-                iterate_through_fds:
-                        check_fds:
-                        ; Fetch file descriptor
-                        mov eax, [sockets + 4 * esi]
-                        push eax
-                        push writefds
-                        call fdisset
-                        add esp, 4
-                        cmp eax, 0
-                        pop eax
-                        ; The port didn't send a response
-                        ; This means it was probably filtered
-                        je port_filtered 
+        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-                        write_zero_byte:
-                        ; Seems like the socket can be written to
-                        ; Let's try to send an empty dud packet to the host
-                        push dword 0
-                        push dword 0
-                        push eax
-                        call sys_write
-                        add esp, 12 
-                        test eax, eax
-                        ; There was an error in writing
-                        ; The port was probably closed
-                        js port_closed
-                        
-                        print_port:
-                        ; We found an open port!
-                        ; Convert the port number to a printable string
-                        movzx edx, word [portsmap + 2 * esi]
-                        push portstr
-                        push edx
-                        call ultostr 
-                        add esp, 8
-                        ; "%s OPEN"
-                        push dword portstr 
-                        call printstr 
-                        mov [esp], dword msg_port_open
-                        call printstr
-                        add esp, 4
-                        inc dword [ports_open]
-                        jmp check_next_socket
+        wait_for_connections:
+        ; Wait for requested connects to finish
+        push timeval_1s
+        push dword 0
+        push dword 0
+        push dword 0
+        push dword 0
+        call sys_select
+        add esp, 20
+        ; Linux select(3) will mangle timeval structs
+        mov [timeval_1s+4], dword 400000
 
-                        ; TODO: add failed ports to arrays/sets?
-                        port_filtered:
-                        inc dword [ports_filtered]
-                        jmp check_next_socket
-                        port_closed:
-                        inc dword [ports_closed]
-                        check_next_socket:
-                        inc esi
-                        cmp esi, MAX_SOCKETS
-                        jl iterate_through_fds
+        call_select: 
+        ; Wake up and smell the ashes...
+        ; Time to check up on our sockets
+        push timeval_0s
+        push dword 0
+        push dword writefds
+        push dword 0
+        ; nfds = maximum fd + 1
+        inc edi 
+        push edi
+        call sys_select
+        add esp, 20
 
-                ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+        cmp eax, 0
+        ; All sockets will block on write, skip to next iteration
+        je free_sockets
+        jns check_for_connected_sockets 
 
-                free_sockets:
-                ; Kill all the sockets we opened 
-                push dword MAX_SOCKETS
-                push sockets
-                call killsockets
-                add esp, 8
-                ; Check to see if we're done
-                cmp bx, word 1024 
-                jl parallel_scan_loop
-
-exit:
-        push portstr
-                push dword [ports_open]
-                call ultostr
-                add esp, 4
-        call printstr
-        mov [esp], dword msg_open
-        call printstr
-        mov [esp], dword portstr
-                push dword [ports_filtered]
-                call ultostr
-                add esp, 4
-        call printstr
-        mov [esp], dword msg_filtered
-        call printstr
-        mov [esp], dword portstr
-                push dword [ports_closed]
-                call ultostr
-                add esp, 4
-        call printstr
-        mov [esp], dword msg_closed
+        select_error:
+        ; We had some sort of trouble with select(2)
+        ; Save -errno on stack and kill all sockets
+        push eax
+        push max_parallel_sockets
+        push sockets
+        call kill_sockets
+        add esp, 8
+        push select_error_msg
         call printstr
         add esp, 4
+        pop ebx
+        not ebx
+        inc ebx
+        jmp exit
 
+        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+        check_for_connected_sockets:
+        ; Check writefds for our sockets
+        ; Reset index into socket array
+        xor esi, esi
+        iterate_through_fds:
+                check_if_write_blocks:
+                ; Fetch file descriptor
+                mov eax, [sockets + 4 * esi]
+                push eax
+                push writefds
+                call fdisset
+                add esp, 4
+                cmp eax, 0
+                pop eax
+                ; This port didn't respond to our TCP request:
+                ; this means it was probably filtered
+                je port_was_filtered 
+
+                send_empty_packet:
+                ; Seems like the socket can be written to
+                ; Let's try to send an empty dud packet to the host
+                push dword 0
+                push dword 0
+                push eax
+                call sys_write
+                add esp, 12 
+                test eax, eax
+                ; We had trouble sending: 
+                ; the port was probably closed
+                js port_was_closed
+                
+                print_port:
+                ; We found an open port!
+                ; Convert the port number to a printable string
+                movzx edx, word [portsmap + 2 * esi]
+                push portstr
+                push edx
+                call ultostr 
+                add esp, 8
+                push dword portstr 
+                call printstr 
+                ; Print new line after port
+                mov [esp], dword newline_msg
+                call printstr
+                add esp, 4
+                jmp check_next_socket
+
+                port_was_filtered:
+                port_was_closed:
+                check_next_socket:
+                inc esi
+                cmp esi, max_parallel_sockets
+                jl iterate_through_fds
+
+        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+        free_sockets:
+        ; Kill all the sockets we opened 
+        push dword max_parallel_sockets
+        push sockets
+        call kill_sockets
+        add esp, 8
+        ; Check if we're done
+        cmp bx, word 1024 
+        jl tcp_scan
+
+exit:
         ; We expect ebx to contain exit status 
         mov ebp, esp
         mov eax, 1
@@ -426,10 +386,10 @@ strlen:
         pop ebp
         ret
 
-; parseip - convert IPv4 address from text to binary form
+; parse_octets - convert IPv4 address from text to binary form
 ;       expects: ip string, destination buffer
 ;       returns: 0 in eax, ~0 on error
-parseip:
+parse_octets:
         push ebp
         mov ebp, esp
         sub esp, 4
@@ -678,10 +638,10 @@ fdisset:
         pop ebp
         ret
 
-; killsockets - close first n fd in the socket array 
+; kill_sockets - close first n fd in the socket array 
 ;       expects: array, n
 ;       returns: nothing
-killsockets:
+kill_sockets:
         push ebp
         mov ebp, esp
 
