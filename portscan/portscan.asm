@@ -2,6 +2,27 @@
 ; Usage: portscan [OPTIONS] HOST
 ; Author: Eugene Ma
 
+;; NASM preprocessor
+
+; IPv4 packet header 
+struc ip_h
+        ip_vhl: resb 1 ; version << 4 | header length 
+        ip_tos: resb 1 ; type of service             
+        ip_len: resw 1 ; total length of datagram in bytes 
+        ip_id:  resw 1 ; identity: a unique value for the sender
+        ip_off: resw 1 ; fragment offset & flags (0x8000||0x4000||0x2000)
+        ip_ttl: resb 1 ; Time To Live
+        ip_pr:  resb 1 ; protocol
+        ip_sum: resw 1 ; header checksum
+        ip_src: resd 1 ; source address
+        ip_dst: resd 1 ; destination address
+endstruc
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
 section .data
         socket_error_msg:       db 'error: sys_socket failed', 10, 0
         select_error_msg:       db 'error: sys_select failed', 10, 0
@@ -18,7 +39,23 @@ section .data
 
         errno_eagain            equ -115
         errno_einprogress       equ -11
-        max_parallel_sockets             equ 64
+        max_parallel_sockets    equ 64
+
+        ping_packet:
+                ping_ip_h:
+                istruc ip_h
+                        at ip_vhl, db 0x45      ; version = 4, header length = 5
+                        at ip_tos, db 0         ; type of service (unneeded)
+                        at ip_len, dw 0x54      ; total length = 84
+                        at ip_id,  dw 0         ; some id
+                        at ip_off, dw 0x40      ; don't fragment, offset = 0
+                        at ip_ttl, db 0x40      ; time to live = 64
+                        at ip_pr,  db 0x1       ; protocol = IPPROTO_ICMP
+                        at ip_sum, dw 0x0       ; kernel handles this?
+                        at ip_src, dd 0x0       ; src ip: fill this in later
+                        at ip_dst, dd 0x0       ; dest ip: fill this in later
+                iend
+                ping_icmp_h:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -51,20 +88,6 @@ section .bss
         octets:         resd 1 
         ; For port to string conversion 
         portstr:        resb 12 
-
-        ; IP header
-        struct ip_h: 
-                ip_vhl db 1 ; version << 4 | header length 
-                ip_tos db 1 ; type of service             
-                ip_len dw 1 ; total length of datagram in bytes 
-                ip_id  dw 1 ; identity: a unique value for the sender
-                ip_off dw 1 ; fragment offset & flags (0x8000||0x4000||0x2000)
-                ip_ttl db 1 ; Time To Live
-                ip_pr  db 1 ; protocol
-                ip_sum dw 1 ; header checksum
-                ip_src dd 1 ; source address
-                ip_dst dd 1 ; destination address
-        endstruct
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
