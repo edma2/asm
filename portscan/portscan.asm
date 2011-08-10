@@ -20,8 +20,6 @@ section .data
         errno_einprogress       equ -11
         max_parallel_sockets             equ 64
 
-        ;icmp_header:            db: 
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -54,6 +52,20 @@ section .bss
         ; For port to string conversion 
         portstr:        resb 12 
 
+        ; IP header
+        struct ip_h: 
+                ip_vhl db 1 ; version << 4 | header length 
+                ip_tos db 1 ; type of service             
+                ip_len dw 1 ; total length of datagram in bytes 
+                ip_id  dw 1 ; identity: a unique value for the sender
+                ip_off dw 1 ; fragment offset & flags (0x8000||0x4000||0x2000)
+                ip_ttl db 1 ; Time To Live
+                ip_pr  db 1 ; protocol
+                ip_sum dw 1 ; header checksum
+                ip_src dd 1 ; source address
+                ip_dst dd 1 ; destination address
+        endstruct
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -85,16 +97,6 @@ parse_string_to_octets:
         xor ebx, ebx
         not ebx
         jmp exit
-
-ping_host:
-        ; We do this to minimize the timeout required to wait for TCP
-        ; connections. Called with arguments:
-        ; PF_INET, SOCK_RAW, IPPROTO_ICMP
-        push dword 6 
-        push dword 3
-        push dword 1 
-        call sys_socket
-        add esp, 12
 
 load_struct_sockaddr:
         mov edi, sockaddr
