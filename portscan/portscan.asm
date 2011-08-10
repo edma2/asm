@@ -18,6 +18,23 @@ struc ip_h
         ip_dst: resd 1 ; destination address
 endstruc
 
+; ICMP packet header 
+struc icmp_h
+        icmp_type: resb 1 ; type
+        icmp_code: resb 1 ; code
+        icmp_sum:  resw 1 ; checksum
+        icmp_id:   resw 1 ; identifier
+        icmp_seq:  resw 1 ; sequence number
+endstruc
+
+; Socket address struct
+struc sockaddr_in
+        sin_family: resw 1 ; address family, AF_INET
+        sin_port:   resw 1 ; port number
+        sin_addr:   resd 1 ; internet address
+        sin_zero:   resb 8 ; padding
+endstruc
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -41,36 +58,34 @@ section .data
         errno_einprogress       equ -11
         max_parallel_sockets    equ 64
 
-        ping_packet:
-                ping_ip_h:
-                istruc ip_h
-                        at ip_vhl, db 0x45      ; version = 4, header length = 5
-                        at ip_tos, db 0         ; type of service (unneeded)
-                        at ip_len, dw 0x54      ; total length = 84
-                        at ip_id,  dw 0         ; some id
-                        at ip_off, dw 0x40      ; don't fragment, offset = 0
-                        at ip_ttl, db 0x40      ; time to live = 64
-                        at ip_pr,  db 0x1       ; protocol = IPPROTO_ICMP
-                        at ip_sum, dw 0x0       ; kernel handles this?
-                        at ip_src, dd 0x0       ; src ip: fill this in later
-                        at ip_dst, dd 0x0       ; dest ip: fill this in later
-                iend
-                ping_icmp_h:
+        sockaddr: ; ---{
+        istruc sockaddr_in
+                at sin_family, dw 2 ; AF_INET
+                at sin_port,   dw 0 ; - dynamically set before creating each socket
+                at sin_addr,   dd 0 ; - load octets here after parsing
+                at sin_zero,   db 0,0,0,0,0,0,0,0
+        iend ; ---}
+        sockaddrlen     equ (2+2+4+8)
+
+        ping_packet: ; ---{
+        istruc ip_h
+                at ip_vhl, db 0x45 ; version = 4, header length = 5
+                at ip_tos, db 0    ; type of service (unneeded)
+                at ip_len, dw 0x54 ; total length = 84
+                at ip_id,  dw 0    ; some id
+                at ip_off, dw 0x40 ; don't fragment, offset = 0
+                at ip_ttl, db 0x40 ; time to live = 64
+                at ip_pr,  db 0x1  ; protocol = IPPROTO_ICMP
+                at ip_sum, dw 0x0  ; kernel handles this?
+                at ip_src, dd 0x0  ; src ip: fill this in later
+                at ip_dst, dd 0x0  ; dest ip: fill this in later
+        iend ; ---}
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 section .bss
-        ; struct sockaddr_in {
-        ;       short int          sin_family;  // Address family, AF_INET
-        ;       unsigned short int sin_port;    // Port number
-        ;       struct in_addr     sin_addr;    // Internet address
-        ;       unsigned char      sin_zero[8]; // Same size as struct sockaddr
-        ; };
-        sockaddr:       resb 16
-        sockaddrlen     equ (2+2+4+8)
-
         ; #define __NFDBITS (8 * sizeof(unsigned long))  // bits per file descriptor
         ; #define __FD_SETSIZE 1024                      // bits per fd_set
         ; #define __FDSET_LONGS (__FD_SETSIZE/__NFDBITS) // ints per fd_set
@@ -101,7 +116,7 @@ _start:
 
 parse_string_to_octets:
         ; Parse the ip string into octets 
-        push octets             
+        push (sockaddr + sin_addr)
         push dword [ebp+8]   
         call parse_octets
         add esp, 8
@@ -109,7 +124,7 @@ parse_string_to_octets:
         ; Check the return value
         test eax, eax
         js malformed_ip
-        jmp load_struct_sockaddr
+        jmp tcp_scan
 
         ; Print error message and exit
         malformed_ip:
@@ -120,22 +135,6 @@ parse_string_to_octets:
         xor ebx, ebx
         not ebx
         jmp exit
-
-load_struct_sockaddr:
-        mov edi, sockaddr
-        cld            
-        ; sin_family = AF_INET
-        mov ax, word 2 
-        stosw           
-        ; Fill in the port later (sin_port)
-        add edi, 2
-        ; sin_addr 
-        mov eax, [octets]
-        stosd
-        ; Fill padding
-        xor eax, eax
-        rep stosd
-        rep stosd
 
 ; Scan ports 0-1023, last port always stored in ebx
 ; cdecl: ebx/esi/edi should always be perserved by the callee
