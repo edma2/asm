@@ -11,6 +11,7 @@ section .data
                 .sin_addr:      dd 0            ; Load octets here after parsing
                 .sin_zero:      db 0,0,0,0,0,0,0,0
         sockaddrlen             equ $-sockaddr
+        sockaddrlen_addr        dd sockaddrlen  ; recvfrom(2) expects this as an address ?!
 
         socket_error_msg:       db 'error: sys_socket failed', 10, 0
         select_error_msg:       db 'error: sys_select failed', 10, 0
@@ -23,7 +24,7 @@ section .data
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
         ; }; 
-        timeval_1s:             dd 0, 400000    ; Time to wait for packets
+        timeval_1s:             dd 0, 500000    ; Initialize to 0.5 seconds
         timeval_0s:             dd 0, 0         ; No wait
 
         max_sockets             equ 64
@@ -41,6 +42,7 @@ section .bss
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
         writefds:       resd 32                 ; Used as select(2) argument
+        readfds:        resd 32                  ; Used as select(2) argument
         sockfds:        resd max_sockets        ; Where we save all open sockets 
         portsmap:       resw max_sockets        ; Each socket is mapped to a port
         hostaddr:       resd 1                  ; Address of host in binary format octets
@@ -53,6 +55,7 @@ section .text
 
 _start:
         mov ebp, esp
+        cld                             ; String operations will increment pointers by default
 
 ; Parse command line arguments into valid octets
 ; Usage: portscan <host ip>
@@ -80,14 +83,10 @@ malformed_ip:
         not ebx                         ; and turn on all the bits (ebx = -1)
         jmp exit                        ; Exit with error status 
 
-; Build an ICMP packet with message type 8 (Echo request)
-; The kernel will craft the IP header for us because IP_HDRINCL is disabled by default
+; Build an ICMP packet with message type 8 (Echo request). The kernel will craft
+; the IP header for us because IP_HDRINCL is disabled by default
 assemble_packet:
-        cld                             ; String operations will increment pointers by default
         mov edi, icmphdr                ; Point esi to start of packet
-
-        ; Start of ICMP header - see http://www.networksorcery.com/enp/protocol/icmp/msg8.htm
-        ;--------------------------------------------------------------------
         mov al, 8                       ; Type: 8 (Echo request)
         stosb                           
         xor al, al                      ; Code: 0 (Cleared for this type)
@@ -111,7 +110,7 @@ assemble_packet:
 ; To create a raw socket, user need root permissions
 create_icmp_socket:
         push dword 1                    ; Protocol: IPPROTO_ICMP
-        push dword 3                    ; Type: SOCK_RAW
+        push dword (3 | 4000q)          ; Type: SOCK_RAW | O_NONBLOCK
         push dword 2                    ; Domain: PF_INET
         call sys_socket                 ; Create raw socket
         add esp, 12                     ; Clean up stack
@@ -133,29 +132,67 @@ create_icmp_socket:
         
 ; Now we should be ready to send bytes to the other host 
 send_ping:
-        push dword sockaddrlen          ; socklen_t dest_len
-        push dword sockaddr             ; const struct sockaddr *dest_addr
-        push dword 0                    ; int flags
-        push dword icmphdrlen           ; size_t length
-        push dword icmphdr              ; const void *message
-        push dword [sockfds]            ; int socket
-        call sys_sendto                 ; Try sending the packet
+        ; Socket is in non-blocking mode, so we send and receieve data
+        ; asynchronously. In this case, send an ICMP Echo request, and block
+        ; until socket has data ready to be read.
+        push dword sockaddrlen          ; Socket address length
+        push dword sockaddr             ; Socket address
+        push dword 0                    ; No flags
+        push dword icmphdrlen           ; Message length
+        push dword icmphdr              ; Message
+        push dword [sockfds]            ; Socket
+        call sys_sendto                 ; Send data asynchronously
+        add esp, 24                     ; Clean up stack
+        push dword sockaddrlen_addr     ; Address of socket address length
+        push dword sockaddr             ; Socket address
+        push dword 0                    ; No flags
+        push dword 0                    ; Length of buffer 
+        push dword 0                    ; Buffer (=NULL)
+        push dword [sockfds]            ; Socket
+        call sys_recvfrom               ; Receieve data asynchronously
         add esp, 24                     ; Clean up stack
 
-        test eax, eax                   ; Check return value
-        js send_ping_error              ; There was an error in sending the packet
-        jmp debug_quit
+get_latency:
+        ; Timeout is an upper bound on how long to wait before select(2)
+        ; returns. Linux will adjust the timeval struct to reflect the time
+        ; remaining, this solution is is not portable, as the man page for
+        ; select(2) tells us to consider the value of the struct undefined
+        ; after select returns. 
+        push dword [sockfds]            ; Add socket to readfds
+        push dword readfds              
+        call fdset
+        add esp, 8                      ; Clean up stack
+        
+        ; Reset timer
+        mov [timeval_1s + 4], dword 500000    
 
-        send_ping_error:
-        mov ebx, eax                    ; Save -errno in ebx
-        push sendto_error_msg
+        push timeval_1s                 ; Initialized to 0.5 second
+        push dword 0                    ; Don't wait for exceptfds
+        push dword 0                    ; Don't wait for writefds
+        push dword readfds              ; Wait for readfds
+        push dword [sockfds]            ; nfds = highest fd + 1
+        inc dword [esp]
+        call sys_select                 
+        add esp, 20                     ; Clean up stack
+
+        cmp eax, 0                      ; Sockets did not receive any data
+        jz send_ping                    ; Try again
+
+        ; Now calculate the latency
+        mov eax, 500000
+        sub eax, [timeval_1s + 4]
+
+        push dword portstr
+        push eax
+        call ultostr
+        add esp, 4
         call printstr
         add esp, 4
-        not ebx                         ; Convert -errno to errno
-        inc ebx
-        jmp exit
 
         debug_quit:
+        push dword [sockfds]
+        call sys_close
+        add esp, 4
         mov eax, 1
         mov ebx, 0
         int 0x80
@@ -454,7 +491,6 @@ strlen:
         mov ebp, esp
         push edi
 
-        cld     
         xor eax, eax
         xor ecx, ecx
         not ecx
@@ -485,7 +521,6 @@ parse_octets:
         lea edi, [ebp-4]
         ; This value comes in handy when its on the stack
         push edi
-        cld
         parse_loop:
                 ; Load the string into the four byte buffer we allocated
                 load_string:
@@ -869,7 +904,7 @@ sys_select:
         ret
 
 ; sys_sendto 
-;       Send a datagram packet to target host
+;       Send a packet to target host
 ;               Expects: socket, buffer, length, flags, sockaddr, sockaddrlen
 ;               Returns: number of characters sent, -errno on error
 sys_sendto:
@@ -880,6 +915,26 @@ sys_sendto:
         ; sys_socketcall = 102
         mov eax, 102
         mov ebx, 11
+        lea ecx, [ebp+8] 
+        int 0x80
+
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; sys_recvfrom 
+;       Receieve a packet from target host
+;               Expects: socket, buffer, length, flags, sockaddr, sockaddrlen
+;               Returns: number of characters received, -errno on error
+sys_recvfrom:
+        push ebp
+        mov ebp, esp
+        push ebx
+
+        ; sys_socketcall = 102
+        mov eax, 102
+        mov ebx, 12
         lea ecx, [ebp+8] 
         int 0x80
 
