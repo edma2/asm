@@ -24,8 +24,7 @@ section .data
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
         ; }; 
-        timeval_1s:             dd 0, 500000    ; Initialize to 0.5 seconds
-        timeval_0s:             dd 0, 0         ; No wait
+        zerotimeout:             dd 0, 0         ; No wait
 
         max_sockets             equ 64
         icmphdr:                db 64           ; For sending "ping" packet           
@@ -42,11 +41,13 @@ section .bss
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
         writefds:       resd 32                 ; Used as select(2) argument
-        readfds:        resd 32                  ; Used as select(2) argument
+        readfds:        resd 32                 ; Used as select(2) argument
         sockfds:        resd max_sockets        ; Where we save all open sockets 
         portsmap:       resw max_sockets        ; Each socket is mapped to a port
         hostaddr:       resd 1                  ; Address of host in binary format octets
         portstr:        resb 12 
+        timeout_volatile: resd 2                ; Linux will mangle this after select(2) returns
+        timeout_master: resd 2                  ; A "master" copy of timeout
 
 ; ==============================================================================
 
@@ -164,9 +165,9 @@ get_latency:
         add esp, 8                      ; Clean up stack
         
         ; Reset timer
-        mov [timeval_1s + 4], dword 500000    
+        mov [timeout_volatile + 4], dword 500000    
 
-        push timeval_1s                 ; Initialized to 0.5 second
+        push timeout_volatile           ; Initialized to 0.5 second
         push dword 0                    ; Don't wait for exceptfds
         push dword 0                    ; Don't wait for writefds
         push dword readfds              ; Wait for readfds
@@ -180,22 +181,15 @@ get_latency:
 
         ; Now calculate the latency
         mov eax, 500000
-        sub eax, [timeval_1s + 4]
+        sub eax, [timeout_volatile + 4]
+        ; Adjust latency to account for connect(2)
+        shl eax, 2
+        mov [timeout_master + 4], eax
 
-        push dword portstr
-        push eax
-        call ultostr
-        add esp, 4
-        call printstr
-        add esp, 4
-
-        debug_quit:
+        ; Close "ping" socket
         push dword [sockfds]
         call sys_close
         add esp, 4
-        mov eax, 1
-        mov ebx, 0
-        int 0x80
         
 ; Scan ports 0-1023, last port always stored in ebx
 ; cdecl: ebx/esi/edi should always be perserved by the callee
@@ -304,21 +298,23 @@ tcp_scan:
         ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
         wait_for_connections:
+        ; Reset latency timer
+        lea esi, [timeout_master + 4]
+        lea edi, [timeout_volatile + 4]
+        movsd
         ; Wait for requested connects to finish
-        push timeval_1s
+        push timeout_volatile
         push dword 0
         push dword 0
         push dword 0
         push dword 0
         call sys_select
         add esp, 20
-        ; Linux select(3) will mangle timeval structs
-        mov [timeval_1s+4], dword 400000
 
         call_select: 
         ; Wake up and smell the ashes...
         ; Time to check up on our sockets
-        push timeval_0s
+        push zerotimeout
         push dword 0
         push dword writefds
         push dword 0
@@ -750,6 +746,22 @@ fdisset:
         shl eax, cl
         and eax, [edx]
         shr eax, cl ; so we return 1 on success
+
+        mov esp, ebp
+        pop ebp
+        ret
+
+; fdzero - zero out an fd_set
+;       expects: pointer to struct fd_set
+;       returns: nothing
+fdzero:
+        push ebp
+        mov ebp, esp
+
+        xor eax, eax
+        mov ecx, 32
+        mov edi, [ebp + 8]
+        rep stosd
 
         mov esp, ebp
         pop ebp
