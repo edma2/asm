@@ -1,89 +1,36 @@
 ; vim: ft=nasm
-; Usage: portscan [OPTIONS] HOST
+; Usage: portscan <host>
 ; Author: Eugene Ma
 
-;; NASM preprocessor
-
-; IPv4 packet header 
-struc ip_h
-        ip_vhl: resb 1 ; version << 4 | header length 
-        ip_tos: resb 1 ; type of service             
-        ip_len: resw 1 ; total length of datagram in bytes 
-        ip_id:  resw 1 ; identity: a unique value for the sender
-        ip_off: resw 1 ; fragment offset & flags (0x8000||0x4000||0x2000)
-        ip_ttl: resb 1 ; Time To Live
-        ip_pr:  resb 1 ; protocol
-        ip_sum: resw 1 ; header checksum
-        ip_src: resd 1 ; source address
-        ip_dst: resd 1 ; destination address
-endstruc
-
-; ICMP packet header 
-struc icmp_h
-        icmp_type: resb 1 ; type
-        icmp_code: resb 1 ; code
-        icmp_sum:  resw 1 ; checksum
-        icmp_id:   resw 1 ; identifier
-        icmp_seq:  resw 1 ; sequence number
-endstruc
-
-; Socket address struct
-struc sockaddr_in
-        sin_family: resw 1 ; address family, AF_INET
-        sin_port:   resw 1 ; port number
-        sin_addr:   resd 1 ; internet address
-        sin_zero:   resb 8 ; padding
-endstruc
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
+; ==============================================================================
 
 section .data
+        sockaddr:
+                .sin_family:    dw 2            ; AF_INET
+                .sin_port:      dw 0            ; Dynamically set before creating each socket
+                .sin_addr:      dd 0            ; Load octets here after parsing
+                .sin_zero:      db 0,0,0,0,0,0,0,0
+        sockaddrlen             equ $-sockaddr
+
         socket_error_msg:       db 'error: sys_socket failed', 10, 0
         select_error_msg:       db 'error: sys_select failed', 10, 0
         parse_error_msg:        db 'error: Malformed IP address', 10, 0
         connect_error_msg:      db 'error: Unexpected connect error', 10, 0
+        sendto_error_msg:       db 'error: sys_sendto failed', 10, 0
         newline_msg:            db 10, 0
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
         ; }; 
-        timeval_1s:             dd 0, 400000
-        timeval_0s:             dd 0, 0
+        timeval_1s:             dd 0, 400000    ; Time to wait for packets
+        timeval_0s:             dd 0, 0         ; No wait
 
-        errno_eagain            equ -115
-        errno_einprogress       equ -11
-        max_parallel_sockets    equ 64
+        max_sockets             equ 64
+        icmphdr:                db 64           ; For sending "ping" packet           
+        icmphdrlen              equ 64          ; 8 byte header + 56 byte data
 
-        sockaddr: ; ---{
-        istruc sockaddr_in
-                at sin_family, dw 2 ; AF_INET
-                at sin_port,   dw 0 ; - dynamically set before creating each socket
-                at sin_addr,   dd 0 ; - load octets here after parsing
-                at sin_zero,   db 0,0,0,0,0,0,0,0
-        iend ; ---}
-        sockaddrlen     equ (2+2+4+8)
-
-        ping_packet: ; ---{
-        istruc ip_h
-                at ip_vhl, db 0x45 ; version = 4, header length = 5
-                at ip_tos, db 0    ; type of service (unneeded)
-                at ip_len, dw 0x54 ; total length = 84
-                at ip_id,  dw 0    ; some id
-                at ip_off, dw 0x40 ; don't fragment, offset = 0
-                at ip_ttl, db 0x40 ; time to live = 64
-                at ip_pr,  db 0x1  ; protocol = IPPROTO_ICMP
-                at ip_sum, dw 0x0  ; kernel handles this?
-                at ip_src, dd 0x0  ; src ip: fill this in later
-                at ip_dst, dd 0x0  ; dest ip: fill this in later
-        iend ; ---}
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; ==============================================================================
 
 section .bss
         ; #define __NFDBITS (8 * sizeof(unsigned long))  // bits per file descriptor
@@ -93,20 +40,13 @@ section .bss
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
-        writefds:       resb 128
-        
-        ; Where socket fds live
-        sockets:        resd max_parallel_sockets 
-        ; Map each socket to a port (e.g. port of socket i = portsmap[sockets[i]])        
-        portsmap:       resw max_parallel_sockets
-        ; Put octets here after parsing
-        octets:         resd 1 
-        ; For port to string conversion 
+        writefds:       resd 32                 ; Used as select(2) argument
+        sockfds:        resd max_sockets        ; Where we save all open sockets 
+        portsmap:       resw max_sockets        ; Each socket is mapped to a port
+        hostaddr:       resd 1                  ; Address of host in binary format octets
         portstr:        resb 12 
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; ==============================================================================
 
 section .text
         global  _start
@@ -114,28 +54,112 @@ section .text
 _start:
         mov ebp, esp
 
-parse_string_to_octets:
-        ; Parse the ip string into octets 
-        push (sockaddr + sin_addr)
-        push dword [ebp+8]   
-        call parse_octets
-        add esp, 8
-        
-        ; Check the return value
-        test eax, eax
-        js malformed_ip
-        jmp tcp_scan
+; Parse command line arguments into valid octets
+; Usage: portscan <host ip>
+parse_argv:
+        push dword hostaddr             ; Load destination address
+        push dword [ebp+8]              ; Load first argument argv[1]
+        call parse_octets               ; Parse destination address
+        add esp, 8                      ; Clean up stack
+        test eax, eax                   ; Check return value
+        js malformed_ip                 ; User invoked program incorrectly
 
-        ; Print error message and exit
-        malformed_ip:
-        push parse_error_msg
+        ; IPv4 address was valid; inject in sockaddr->sin_addr 
+        load_sockaddr: 
+        mov esi, hostaddr           
+        mov edi, sockaddr.sin_addr
+        movsd
+        jmp assemble_packet             ; Send a "ping" to the target host
+
+; The IPv4 address didn't look right
+malformed_ip:
+        push parse_error_msg            ; Load error message
+        call printstr                   ; Print the error message string             
+        add esp, 4                      ; Clean up stack
+        xor ebx, ebx                    ; Zero out ebx...
+        not ebx                         ; and turn on all the bits (ebx = -1)
+        jmp exit                        ; Exit with error status 
+
+; Build an ICMP packet with message type 8 (Echo request)
+; The kernel will craft the IP header for us because IP_HDRINCL is disabled by default
+assemble_packet:
+        cld                             ; String operations will increment pointers by default
+        mov edi, icmphdr                ; Point esi to start of packet
+
+        ; Start of ICMP header - see http://www.networksorcery.com/enp/protocol/icmp/msg8.htm
+        ;--------------------------------------------------------------------
+        mov al, 8                       ; Type: 8 (Echo request)
+        stosb                           
+        xor al, al                      ; Code: 0 (Cleared for this type)
+        stosb                          
+        xor ax, ax                      ; Calculate ICMP checksum later
+        stosw                         
+        stosd                           ; Identifier: 0, Sequence number: 0
+        
+        ; Now we have to zero out 56 bytes of ICMP padding data
+        xor eax, eax                    
+        mov ecx, 14                     ; 56 bytes = 14 words
+        rep stosd                       ; Load 56 zero bytes
+
+        ; Calculate ICMP checksum which includes ICMP header and data
+        push dword (icmphdrlen/2)       ; Header + data length in (16-bit) words
+        push dword icmphdr              ; Pass header + data
+        call cksum                      ; Call subroutine to calculate checksum
+        add esp, 8                      ; Clean up stack
+        mov [icmphdr + 2], word ax      ; Inject checksum result into packet
+
+; To create a raw socket, user need root permissions
+create_icmp_socket:
+        push dword 1                    ; Protocol: IPPROTO_ICMP
+        push dword 3                    ; Type: SOCK_RAW
+        push dword 2                    ; Domain: PF_INET
+        call sys_socket                 ; Create raw socket
+        add esp, 12                     ; Clean up stack
+        
+        test eax, eax                   ; Check for return value
+        js create_icmp_socket_error     ; If signed, then something went wrong
+        mov [sockfds], eax              ; Otherwise, store the file descriptor in sockfds[0]
+        jmp send_ping                   ; Send a "ping" to host
+
+        ; We had socket troubles; does user have root permissions?
+        create_icmp_socket_error:
+        mov ebx, eax                    ; Save -errno in ebx
+        push dword socket_error_msg     ; Load error message on stack
+        call printstr                   ; Print it to standard output
+        add esp, 4                      ; Clean up stack
+        not ebx                         ; Convert -errno to errno
+        inc ebx
+        jmp exit                        ; Exit program
+        
+; Now we should be ready to send bytes to the other host 
+send_ping:
+        push dword sockaddrlen          ; socklen_t dest_len
+        push dword sockaddr             ; const struct sockaddr *dest_addr
+        push dword 0                    ; int flags
+        push dword icmphdrlen           ; size_t length
+        push dword icmphdr              ; const void *message
+        push dword [sockfds]            ; int socket
+        call sys_sendto                 ; Try sending the packet
+        add esp, 24                     ; Clean up stack
+
+        test eax, eax                   ; Check return value
+        js send_ping_error              ; There was an error in sending the packet
+        jmp debug_quit
+
+        send_ping_error:
+        mov ebx, eax                    ; Save -errno in ebx
+        push sendto_error_msg
         call printstr
         add esp, 4
-        ; Set error status to -1
-        xor ebx, ebx
-        not ebx
+        not ebx                         ; Convert -errno to errno
+        inc ebx
         jmp exit
 
+        debug_quit:
+        mov eax, 1
+        mov ebx, 0
+        int 0x80
+        
 ; Scan ports 0-1023, last port always stored in ebx
 ; cdecl: ebx/esi/edi should always be perserved by the callee
 xor ebx, ebx 
@@ -168,7 +192,7 @@ tcp_scan:
                 ; We should close(3) all our open sockets
                 ; esi should contain count of open sockets
                 push esi
-                push sockets
+                push sockfds
                 call kill_sockets
                 add esp, 8
                 ; Print socket error message and exit(3)
@@ -183,7 +207,7 @@ tcp_scan:
 
                 save_socket:
                 ; Socket seems good, save it to our array and map the port 
-                mov [sockets + 4 * esi], eax 
+                mov [sockfds + 4 * esi], eax 
                 mov [portsmap + 2 * esi], word bx 
                 inc esi
                 ; Update nfds: max(nfds, fd)
@@ -199,8 +223,8 @@ tcp_scan:
                 attempt_connect:
                 ; Initiate TCP handshake to port
                 ; Load port to sockaddr struct in htons() order
-                mov [sockaddr+2], byte bh 
-                mov [sockaddr+3], byte bl 
+                mov [sockaddr.sin_port], byte bh 
+                mov [sockaddr.sin_port+1], byte bl 
                 push sockaddrlen
                 push sockaddr        
                 push eax 
@@ -209,9 +233,9 @@ tcp_scan:
 
                 check_errno:
                 ; We expect to see EAGAIN or EINPROGRESS
-                cmp eax, errno_eagain
+                cmp eax, -115
                 je connect_in_progress
-                cmp eax, errno_einprogress
+                cmp eax, -11
                 je connect_in_progress
                 cmp eax, 0
                 ; This would be very unexpected!
@@ -222,7 +246,7 @@ tcp_scan:
                 ; Save -errno on stack
                 push eax 
                 push esi
-                push sockets
+                push sockfds
                 call kill_sockets
                 add esp, 8
                 push connect_error_msg
@@ -237,7 +261,7 @@ tcp_scan:
                 connect_in_progress:
                 ; "Gather" next socket-port combination or proceed to next step
                 inc word bx
-                cmp esi, max_parallel_sockets
+                cmp esi, max_sockets
                 jl gather_sockets
 
         ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -276,8 +300,8 @@ tcp_scan:
         ; We had some sort of trouble with select(2)
         ; Save -errno on stack and kill all sockets
         push eax
-        push max_parallel_sockets
-        push sockets
+        push max_sockets
+        push sockfds
         call kill_sockets
         add esp, 8
         push select_error_msg
@@ -297,7 +321,7 @@ tcp_scan:
         iterate_through_fds:
                 check_if_write_blocks:
                 ; Fetch file descriptor
-                mov eax, [sockets + 4 * esi]
+                mov eax, [sockfds + 4 * esi]
                 push eax
                 push writefds
                 call fdisset
@@ -341,15 +365,15 @@ tcp_scan:
                 port_was_closed:
                 check_next_socket:
                 inc esi
-                cmp esi, max_parallel_sockets
+                cmp esi, max_sockets
                 jl iterate_through_fds
 
         ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
         free_sockets:
         ; Kill all the sockets we opened 
-        push dword max_parallel_sockets
-        push sockets
+        push dword max_sockets
+        push sockfds
         call kill_sockets
         add esp, 8
         ; Check if we're done
@@ -362,30 +386,65 @@ exit:
         mov eax, 1
         int 0x80
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; ------------------------------------------------------------------------------
+; new_raw_socket - Returnsa :q
+; ------------------------------------------------------------------------------
 
+
+; ------------------------------------------------------------------------------
+; cksum - IP header style checksum for given length in words (16-bit) 
+;  Expects: pointer to data, data length in words 
+;  Returns: checksum 
+cksum:
+        push ebp                ; Save frame pointer
+        mov ebp, esp            ; Set new frame pointer
+        push esi                ; Preserve esi
+
+        mov esi, [ebp + 8]      ; Load data pointer        
+        mov ecx, [ebp + 12]     ; Load data length
+
+        cmp ecx, 0              ; Check word counter
+        je .done                ; Exit immediately if 0 was passed as argument
+
+        xor dx, dx              ; Accumulate result in dx
+        .loop:
+                lodsw           ; Load next word into ax
+                add dx, ax      ; Perform 16-bit (word size) addition 
+                dec ecx
+                jnz .loop       ; Repeat next word
+        
+        .done:
+        not dx                  ; Take one's complement of result
+        movzx eax, dx           ; Save result in return register
+
+        pop esi                 ; Restore esi
+        mov esp, ebp            ; Deallocate local storage
+        pop ebp                 ; Restore old frame pointer
+        ret                     ; Return
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
 ; printstr - print a string to standard output
-;       expects: string address
-;       returns: bytes written in eax, -errno on error
+;  Expects: string address
+;  Returns: bytes written, -errno on error
 printstr:
-        push ebp
-        mov ebp, esp
+        push ebp                ; Save frame pointer
+        mov ebp, esp            ; Set new frame pointer
         
-        push dword [ebp+8]
-        call strlen
-        add esp, 4
+        push dword [ebp+8]      ; Load string on stack
+        call strlen             ; Get string length (null terminated)
+        add esp, 4              ; Clean up stack
         
-        push eax
-        push dword [ebp+8]
-        push dword 1
-        call sys_write
-        add esp, 12
+        push eax                ; Push length on stack
+        push dword [ebp+8]      ; Push string on stack
+        push dword 1            ; Push standard output file descriptor
+        call sys_write          ; Write string to standard output
+        add esp, 12             ; Clean up stack
 
-        mov esp, ebp
-        pop ebp
-        ret
+        mov esp, ebp            ; Deallocate local storage
+        pop ebp                 ; Restore old frame pointer
+        ret                     ; Return
+; ------------------------------------------------------------------------------
 
 ; strlen - calculate the length of null-terminated string
 ;       expects: string address
@@ -463,9 +522,8 @@ parse_octets:
                 ; An octet has to be an 8-bit value
                 cmp eax, 255
                 jg invalid_ip
-                ; Now load the octet into the destination buffer in big endian
-                ; order/network byte order
-                mov [ebx], eax
+                ; Now load the next octet into the destination octet buffer 
+                mov [ebx], byte al
                 count_octets:
                 push ebx
                 sub ebx, [ebp+12]
@@ -805,6 +863,26 @@ sys_select:
 
         pop edi
         pop esi
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+
+; sys_sendto 
+;       Send a datagram packet to target host
+;               Expects: socket, buffer, length, flags, sockaddr, sockaddrlen
+;               Returns: number of characters sent, -errno on error
+sys_sendto:
+        push ebp
+        mov ebp, esp
+        push ebx
+
+        ; sys_socketcall = 102
+        mov eax, 102
+        mov ebx, 11
+        lea ecx, [ebp+8] 
+        int 0x80
+
         pop ebx
         mov esp, ebp
         pop ebp
