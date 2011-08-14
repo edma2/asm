@@ -937,7 +937,7 @@ icmp_echo:
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
         ; will craft the IP header for us because IP_HDRINCL is disabled by
         ; default, so don't include the IP header.
-        mov edi, sendpacket                 ; Point esi to start of packet
+        mov edi, sendpacket             ; Point esi to start of packet
         mov al, 8                       ; Type: 8 (Echo request)
         stosb                           
         xor al, al                      ; Code: 0 (Cleared for this type)
@@ -990,20 +990,20 @@ icmp_echo:
                 ; asynchronously. In this case, send an ICMP Echo request, and block
                 ; until socket has data ready to be read.
                 icmp_request:
-                push dword sockaddrlen  ; Socket address length
-                push dword sockaddr     ; Socket address
-                push dword 0            ; No flags
+                push dword sockaddrlen          ; Socket address length
+                push dword sockaddr             ; Socket address
+                push dword 0                    ; No flags
                 push dword (icmphdrlen+56)       
-                push dword sendpacket   ; Packet start
+                push dword sendpacket           ; Packet start
                 push dword [icmp_socket]
-                call sys_sendto         ; Send data asynchronously
+                call sys_sendto                 ; Send data asynchronously
                 add esp, 24            
                 ; Check return value
                 test eax, eax
-                jns icmp_select_timeout ; Send finished immediately (!)
-                cmp eax, -115           ; EAGAIN - send in progress
+                jns icmp_select_timeout         ; Send finished immediately (!)
+                cmp eax, -115                   ; EAGAIN - send in progress
                 je icmp_select_timeout
-                cmp eax, -11            ; EINPROGRESS - send in progress
+                cmp eax, -11                    ; EINPROGRESS - send in progress
                 je icmp_select_timeout
                 jmp icmp_echo_try_again
 
@@ -1031,7 +1031,7 @@ icmp_echo:
                 ; Check return value 
                 cmp eax, 0                      
                 jle icmp_echo_try_again         ; Sockets did not respond to ICMP Echo request
-                jmp icmp_echo_success           ; Ping was successful
+                jmp icmp_select_ready           ; Ping was successful
                 
                 ; Should we try again?
                 icmp_echo_try_again:
@@ -1039,15 +1039,15 @@ icmp_echo:
                 jz icmp_echo_failed             ; We used up all 10 tries
                 jmp send_icmp_packet_loop       ; Try again
 
-        icmp_echo_success:
+        icmp_select_ready:
         ; Receive the ICMP Echo request packet
-        push dword sockaddrlen_addr  ; Address of socket address length
-        push dword sockaddr     ; Socket address
-        push dword 0            ; No flags
+        push dword sockaddrlen_addr             ; Address of socket address length
+        push dword sockaddr                     ; Socket address
+        push dword 0                            ; No flags
         push dword (iphdrlen+icmphdrlen+56)    
         push dword recvpacket 
         push dword [icmp_socket]
-        call sys_recvfrom       ; Receieve data asynchronously
+        call sys_recvfrom                       ; Receieve data asynchronously
         add esp, 24             
         ; Check return value
         test eax, eax
