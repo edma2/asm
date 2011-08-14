@@ -56,8 +56,8 @@ section .bss
         timeout_master:         resd 2                  ; A "master" copy
         timeout_zero:           resd 2                  ; Leave as zero
 
-        packet:                 resb 1024               ; Packet to be transmitted
-        recv_buffer:            resb 1024               ; Data received
+        sendpacket:                 resb 1024               ; Packet to be transmitted
+        recvpacket:            resb 1024               ; Data received
 
         iphdrlen                equ 20                  ; Length of IP header
         icmphdrlen              equ 8                   ; Length of ICMP header
@@ -80,6 +80,11 @@ parse_argv:
         add esp, 8                      ; Clean up stack
         test eax, eax                   ; Check return value
         js malformed_ip_error           ; User invoked program incorrectly
+        load_socket_address: 
+        ; IPv4 address was valid; load sockaddr->sin_addr 
+        mov esi, hostaddr           
+        mov edi, sockaddr.sin_addr
+        movsd
         jmp ping_host
 
         malformed_ip_error:
@@ -90,12 +95,6 @@ parse_argv:
         xor ebx, ebx                    ; Zero out ebx...
         not ebx                         ; and turn on all the bits (ebx = -1)
         jmp exit                        ; Exit with error status 
-
-        load_socket_address: 
-        ; IPv4 address was valid; load sockaddr->sin_addr 
-        mov esi, hostaddr           
-        mov edi, sockaddr.sin_addr
-        movsd
 
 ping_host:
         call icmp_echo
@@ -924,12 +923,12 @@ sys_setsockopt:
 
 ; ------------------------------------------------------------------------------
 ; icmp_echo
-;       Send an ICMP Echo request to target host, and recieve reply in recv_buffer
+;       Send an ICMP Echo request to target host, and recieve reply in recvpacket
 ;               Expects: stack - nothing
 ;                        sockaddr - pointing to target host 
 ;               Returns: eax - 0 on success, -1 on error
 ;                        timeout_master - 4*RRT latency in microseconds
-;                        recv_buffer - received data
+;                        recvpacket - received data
 icmp_echo:
         push ebx
         push edi
@@ -938,7 +937,7 @@ icmp_echo:
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
         ; will craft the IP header for us because IP_HDRINCL is disabled by
         ; default, so don't include the IP header.
-        mov edi, packet                 ; Point esi to start of packet
+        mov edi, sendpacket                 ; Point esi to start of packet
         mov al, 8                       ; Type: 8 (Echo request)
         stosb                           
         xor al, al                      ; Code: 0 (Cleared for this type)
@@ -954,10 +953,10 @@ icmp_echo:
         calculate_icmp_checksum:
         ; Calculate ICMP checksum which includes ICMP header and data
         push dword ((icmphdrlen+56)/2)  ; Length of packet in words
-        push dword packet               ; Load pointer to packet on stack
+        push dword sendpacket           ; Load pointer to packet on stack
         call cksum                     
         add esp, 8                      ; Clean up stack
-        mov [packet + 2], word ax       ; Inject checksum result into packet
+        mov [sendpacket + 2], word ax   ; Inject checksum result into packet
 
         create_icmp_socket:
         ; To create a raw socket, user need root permissions
@@ -986,7 +985,7 @@ icmp_echo:
         ; Initialize ping counter to 10. Try to ping this many times until we
         ; get a response from the host (or give up)!
         mov ebx, 10                             
-        .loop:
+        send_icmp_packet_loop:
                 ; Socket is in non-blocking mode, so we send and receieve data
                 ; asynchronously. In this case, send an ICMP Echo request, and block
                 ; until socket has data ready to be read.
@@ -995,7 +994,7 @@ icmp_echo:
                 push dword sockaddr     ; Socket address
                 push dword 0            ; No flags
                 push dword (icmphdrlen+56)       
-                push dword packet       ; Packet start
+                push dword sendpacket   ; Packet start
                 push dword [icmp_socket]
                 call sys_sendto         ; Send data asynchronously
                 add esp, 24            
@@ -1009,11 +1008,11 @@ icmp_echo:
                 jmp icmp_echo_try_again
         
                 icmp_reply:
-                push dword sockaddrlen  ; Address of socket address length
+                push dword sockaddrlen_addr  ; Address of socket address length
                 push dword sockaddr     ; Socket address
                 push dword 0            ; No flags
                 push dword (iphdrlen+icmphdrlen+56)    
-                push dword recv_buffer 
+                push dword recvpacket 
                 push dword [icmp_socket]
                 call sys_recvfrom       ; Receieve data asynchronously
                 add esp, 24             
@@ -1058,7 +1057,7 @@ icmp_echo:
                 icmp_echo_try_again:
                 dec ebx                         ; Decrement ping "tries" counter
                 jz icmp_echo_failed             ; We used up all 10 tries
-                jmp send_icmp_packet            ; Try again
+                jmp send_icmp_packet_loop       ; Try again
 
         icmp_echo_success:
         ; Now calculate the latency
