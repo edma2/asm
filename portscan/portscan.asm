@@ -56,8 +56,8 @@ section .bss
         timeout_master:         resd 2                  ; A "master" copy
         timeout_zero:           resd 2                  ; Leave as zero
 
-        sendpacket:                 resb 1024               ; Packet to be transmitted
-        recvpacket:            resb 1024               ; Data received
+        sendpacket:             resb 1024               ; Packet to be transmitted
+        recvpacket:             resb 1024               ; Data received
 
         iphdrlen                equ 20                  ; Length of IP header
         icmphdrlen              equ 8                   ; Length of ICMP header
@@ -1000,46 +1000,26 @@ icmp_echo:
                 add esp, 24            
                 ; Check return value
                 test eax, eax
-                jns icmp_reply          ; Send finished immediately (!)
+                jns icmp_select_timeout ; Send finished immediately (!)
                 cmp eax, -115           ; EAGAIN - send in progress
-                je icmp_reply
+                je icmp_select_timeout
                 cmp eax, -11            ; EINPROGRESS - send in progress
-                je icmp_reply
-                jmp icmp_echo_try_again
-        
-                icmp_reply:
-                push dword sockaddrlen_addr  ; Address of socket address length
-                push dword sockaddr     ; Socket address
-                push dword 0            ; No flags
-                push dword (iphdrlen+icmphdrlen+56)    
-                push dword recvpacket 
-                push dword [icmp_socket]
-                call sys_recvfrom       ; Receieve data asynchronously
-                add esp, 24             
-                ; Check return value
-                test eax, eax
-                jns get_timeval_left    ; Recv finished immediately (!!)
-                cmp eax, -115           ; EAGAIN
-                je get_timeval_left
-                cmp eax, -11            ; EINPROGRESS
-                je get_timeval_left
+                je icmp_select_timeout
                 jmp icmp_echo_try_again
 
+                icmp_select_timeout:
                 ; Timeout is an upper bound on how long to wait before select(2)
                 ; returns. Linux will adjust the timeval struct to reflect the time
                 ; remaining, this solution is is not portable, as the man page for
                 ; select(2) tells us to consider the value of the struct undefined
                 ; after select returns. 
-                get_timeval_left:
-                ; Add socket to readfds, which we use to call select(2) 
-                push dword [icmp_socket]           
+                push dword [icmp_socket]        ; Add socket to readfds
                 push readfds
                 call fdset
                 add esp, 8                      
                 
                 ; Reset timer; initialize timer to 0.5 seconds
                 mov [timeout_volatile + 4], dword 500000 
-
                 push dword timeout_volatile     ; Push timer on stack
                 push dword 0                    ; Don't wait for exceptfds
                 push dword 0                    ; Don't wait for writefds
@@ -1060,6 +1040,19 @@ icmp_echo:
                 jmp send_icmp_packet_loop       ; Try again
 
         icmp_echo_success:
+        ; Receive the ICMP Echo request packet
+        push dword sockaddrlen_addr  ; Address of socket address length
+        push dword sockaddr     ; Socket address
+        push dword 0            ; No flags
+        push dword (iphdrlen+icmphdrlen+56)    
+        push dword recvpacket 
+        push dword [icmp_socket]
+        call sys_recvfrom       ; Receieve data asynchronously
+        add esp, 24             
+        ; Check return value
+        test eax, eax
+        js icmp_echo_failed
+
         ; Now calculate the latency
         mov eax, 500000
         sub eax, [timeout_volatile + 4]
