@@ -978,7 +978,7 @@ fn_ping:
         mov ebx, 10                             
         jmp send_ping
 
-        ; On failure, exit with -1 in eax
+        ; On failure, exit with default timeout in eax
         ping_socket_error:
         mov eax, 500000
         jmp ping_exit                   
@@ -1085,7 +1085,7 @@ fn_ping:
         add esp, 4
         pop eax                         ; Restore return value
 
-        ; eax should contain exit code
+        ; eax should contain timeout
         ping_exit:
         pop edi
         pop ebx
