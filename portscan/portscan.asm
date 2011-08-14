@@ -26,10 +26,11 @@ section .data
         ;     int tv_usec;    // microseconds
         ; }; 
         zerotimeout:            dd 0, 0         ; No wait
-
+        timeout_master:         dd 0, 500000    ; A "master" copy of timeout, provide it with 
+                                                ; a default value in case ping fails
         max_sockets             equ 64
-        icmphdr:                db 64           ; For sending "ping" packet           
-        icmphdrlen              equ 64          ; 8 byte header + 56 byte data
+
+        val_one:                dd 1
 
 ; ==============================================================================
 
@@ -41,14 +42,19 @@ section .bss
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
-        writefds:       resd 32                 ; Used as select(2) argument
-        readfds:        resd 32                 ; Used as select(2) argument
-        sockfds:        resd max_sockets        ; Where we save all open sockets 
-        portsmap:       resw max_sockets        ; Each socket is mapped to a port
-        hostaddr:       resd 1                  ; Address of host in binary format octets
-        portstr:        resb 12 
-        timeout_volatile: resd 2                ; Linux will mangle this after select(2) returns
-        timeout_master: resd 2                  ; A "master" copy of timeout
+        writefds:               resd 32                 ; Used as select(2) argument
+        readfds:                resd 32                 ; Used as select(2) argument
+        sockfds:                resd max_sockets        ; Where we save all open sockets 
+        portsmap:               resw max_sockets        ; Each socket is mapped to a port
+        hostaddr:               resd 1                  ; Address of host in binary format octets
+        myaddr:                 resd 1                  ; Address of localhost in binary format octets
+        portstr:                resb 12 
+        timeout_volatile:       resd 2                  ; Linux will mangle this after select(2) returns
+
+        iphdr:                  resb 20                 ; Pointer to start of packet
+        iphdrlen                equ 84                  ; Total size of packet
+        icmphdr:                resb 64                 ; For sending "ping" packet           
+        icmphdrlen              equ 64                  ; 8 byte header + 56 byte data
 
 ; ==============================================================================
 
@@ -63,7 +69,7 @@ _start:
 ; Usage: portscan <host ip>
 parse_argv:
         push dword hostaddr             ; Load destination address
-        push dword [ebp+8]              ; Load first argument argv[1]
+        push dword [ebp + 8]            ; Load first argument argv[1]
         call parse_octets               ; Parse destination address
         add esp, 8                      ; Clean up stack
         test eax, eax                   ; Check return value
@@ -74,7 +80,7 @@ parse_argv:
         mov esi, hostaddr           
         mov edi, sockaddr.sin_addr
         movsd
-        jmp assemble_packet             ; Send a "ping" to the target host
+        jmp ping_host                   ; Send a "ping" to the target host
 
 ; The IPv4 address didn't look right
 malformed_ip:
@@ -85,143 +91,18 @@ malformed_ip:
         not ebx                         ; and turn on all the bits (ebx = -1)
         jmp exit                        ; Exit with error status 
 
-; Build an ICMP packet with message type 8 (Echo request). The kernel will craft
-; the IP header for us because IP_HDRINCL is disabled by default
-assemble_packet:
-        mov edi, icmphdr                ; Point esi to start of packet
-        mov al, 8                       ; Type: 8 (Echo request)
-        stosb                           
-        xor al, al                      ; Code: 0 (Cleared for this type)
-        stosb                          
-        xor ax, ax                      ; Calculate ICMP checksum later
-        stosw                         
-        stosd                           ; Identifier: 0, Sequence number: 0
+ping_host:
+        push dword sockaddrlen
+        push dword sockaddr
+        call fn_ping
+        add esp, 8
         
-        ; Now we have to zero out 56 bytes of ICMP padding data
-        xor eax, eax                    
-        mov ecx, 14                     ; 56 bytes = 14 words
-        rep stosd                       ; Load 56 zero bytes
-
-        ; Calculate ICMP checksum which includes ICMP header and data
-        push dword (icmphdrlen/2)       ; Header + data length in (16-bit) words
-        push dword icmphdr              ; Pass header + data
-        call cksum                      ; Call subroutine to calculate checksum
-        add esp, 8                      ; Clean up stack
-        mov [icmphdr + 2], word ax      ; Inject checksum result into packet
-
-; To create a raw socket, user need root permissions
-create_icmp_socket:
-        push dword 1                    ; Protocol: IPPROTO_ICMP
-        push dword (3 | 4000q)          ; Type: SOCK_RAW | O_NONBLOCK
-        push dword 2                    ; Domain: PF_INET
-        call sys_socket                 ; Create raw socket
-        add esp, 12                     ; Clean up stack
-        
-        test eax, eax                   ; Check for return value
-        js create_icmp_socket_error     ; If signed, then something went wrong
-        mov [sockfds], eax              ; Otherwise, store the file descriptor in sockfds[0]
-        jmp init_ping_tries             ; Send a "ping" to host
-
-        ; We had socket troubles; does user have root permissions?
-        create_icmp_socket_error:
-        mov ebx, eax                    ; Save -errno in ebx
-        push dword socket_error_msg     ; Load error message on stack
-        call printstr                   ; Print it to standard output
-        add esp, 4                      ; Clean up stack
-        not ebx                         ; Convert -errno to errno
-        inc ebx
-        jmp exit                        ; Exit program
-
-init_ping_tries:
-mov ebx, 10                             ; If ping fails 10 times, bail out
-        
-; Now we should be ready to send bytes to the other host 
-send_ping:
-        ; Socket is in non-blocking mode, so we send and receieve data
-        ; asynchronously. In this case, send an ICMP Echo request, and block
-        ; until socket has data ready to be read.
-        push dword sockaddrlen          ; Socket address length
-        push dword sockaddr             ; Socket address
-        push dword 0                    ; No flags
-        push dword icmphdrlen           ; Message length
-        push dword icmphdr              ; Message
-        push dword [sockfds]            ; Socket
-        call sys_sendto                 ; Send data asynchronously
-        add esp, 24                     ; Clean up stack
-        
-        test eax, eax
-        jns recv_response
-        cmp eax, -115
-        je recv_response
-        cmp eax, -11
-        jne ping_failed
-
-        recv_response:
-        push dword sockaddrlen_addr     ; Address of socket address length
-        push dword sockaddr             ; Socket address
-        push dword 0                    ; No flags
-        push dword 0                    ; Length of buffer 
-        push dword 0                    ; Buffer (=NULL)
-        push dword [sockfds]            ; Socket
-        call sys_recvfrom               ; Receieve data asynchronously
-        add esp, 24                     ; Clean up stack
-
-        test eax, eax
-        jns get_latency
-        cmp eax, -115
-        je get_latency
-        cmp eax, -11
-        jne ping_failed
-
-get_latency:
-        ; Timeout is an upper bound on how long to wait before select(2)
-        ; returns. Linux will adjust the timeval struct to reflect the time
-        ; remaining, this solution is is not portable, as the man page for
-        ; select(2) tells us to consider the value of the struct undefined
-        ; after select returns. 
-        push dword [sockfds]            ; Add socket to readfds
-        push dword readfds              
-        call fdset
-        add esp, 8                      ; Clean up stack
-        
-        ; Reset timer
-        mov [timeout_volatile + 4], dword 500000    
-
-        push timeout_volatile           ; Initialized to 0.5 second
-        push dword 0                    ; Don't wait for exceptfds
-        push dword 0                    ; Don't wait for writefds
-        push dword readfds              ; Wait for readfds
-        push dword [sockfds]            ; nfds = highest fd + 1
-        inc dword [esp]
-        call sys_select                 
-        add esp, 20                     ; Clean up stack
-
-        cmp eax, 0                      ; Sockets did not receive ICMP response
-        jg calculate_latency            ; Calculate latency
-        test eax, eax
-        js ping_failed
-        
-        ; Should we try again?
-        dec ebx
-        jz ping_failed
-        jmp send_ping
-
-        calculate_latency:
-        ; Now calculate the latency
-        mov eax, 500000
-        sub eax, [timeout_volatile + 4]
-        ; Adjust latency to account for connect(2)
-        shl eax, 2
-        mov [timeout_master + 4], eax
-
-ping_failed:
-        ; Close "ping" socket
-        push dword [sockfds]
-        call sys_close
-        add esp, 4
+        mov ebx, eax 
+        mov eax, 1
+        int 0x80
 
 ; ------------------------------------------------------------------------------
-        
+
 ; Scan ports 0-1023, last port always stored in ebx
 ; cdecl: ebx/esi/edi should always be perserved by the callee
 xor ebx, ebx 
@@ -290,7 +171,7 @@ tcp_scan:
                 ; Initiate TCP handshake to port
                 ; Load port to sockaddr struct in htons() order
                 mov [sockaddr.sin_port], byte bh 
-                mov [sockaddr.sin_port+1], byte bl 
+                mov [sockaddr.sin_port + 1], byte bl 
                 push sockaddrlen
                 push sockaddr        
                 push eax 
@@ -494,12 +375,12 @@ printstr:
         push ebp                ; Save frame pointer
         mov ebp, esp            ; Set new frame pointer
         
-        push dword [ebp+8]      ; Load string on stack
+        push dword [ebp + 8]      ; Load string on stack
         call strlen             ; Get string length (null terminated)
         add esp, 4              ; Clean up stack
         
         push eax                ; Push length on stack
-        push dword [ebp+8]      ; Push string on stack
+        push dword [ebp + 8]      ; Push string on stack
         push dword 1            ; Push standard output file descriptor
         call sys_write          ; Write string to standard output
         add esp, 12             ; Clean up stack
@@ -521,11 +402,11 @@ strlen:
         xor eax, eax
         xor ecx, ecx
         not ecx
-        mov edi, [ebp+8]
+        mov edi, [ebp + 8]
         repne scasb
         
         not ecx
-        lea eax, [ecx-1]
+        lea eax, [ecx - 1]
         
         pop edi
         mov esp, ebp
@@ -545,9 +426,9 @@ parse_octets:
         push esi
         push edi
 
-        mov esi, [ebp+8]
-        mov ebx, [ebp+12]
-        lea edi, [ebp-4]
+        mov esi, [ebp + 8]
+        mov ebx, [ebp + 12]
+        lea edi, [ebp - 4]
         ; This value comes in handy when its on the stack
         push edi
         parse_loop:
@@ -590,11 +471,11 @@ parse_octets:
                 mov [ebx], byte al
                 count_octets:
                 push ebx
-                sub ebx, [ebp+12]
+                sub ebx, [ebp + 12]
                 cmp ebx, 3
                 pop ebx
                 je last_octet
-                cmp [esi-1], byte '.' 
+                cmp [esi - 1], byte '.' 
                 jne invalid_ip
                 ; We still have more work to do!
                 prepare_next_octet:
@@ -602,12 +483,12 @@ parse_octets:
                 inc ebx
                 ; Finally, reset buffer pointer to start of buffer so we can
                 ; write another octet 
-                lea edi, [ebp-4]
+                lea edi, [ebp - 4]
                 jmp parse_loop
                 last_octet:
                 ; All four octets are supposedly loaded in the destination
                 ; buffer. This means esi is must be pointing to a null byte.
-                cmp [esi-1], byte 0
+                cmp [esi - 1], byte 0
                 jne invalid_ip        
                 jmp parse_success
         invalid_ip:
@@ -636,7 +517,7 @@ strtoul:
         mov ebp, esp
 
         ; Load string address in edx
-        mov edx, [ebp+8]
+        mov edx, [ebp + 8]
         ; Clear "result" register
         xor eax, eax
         loop_digits:
@@ -667,8 +548,8 @@ ultostr:
         push esi
         push edi
         
-        mov eax, [ebp+8]
-        mov edi, [ebp+12]
+        mov eax, [ebp + 8]
+        mov edi, [ebp + 12]
         ; Save original buffer for reference 
         mov esi, edi
         mov ecx, 10
@@ -704,7 +585,7 @@ ultostr:
         inc edi
 
         terminate_string:
-        mov [edi+1], byte 0
+        mov [edi + 1], byte 0
 
         ; Start writing bytes to the buffer from least to most significant
         ; digit (right to left)
@@ -729,7 +610,7 @@ ultostr:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; fdset - add a file descriptor to struct fd_set
+; fdset - add or remove file descriptor to struct fd_set
 ;       expects: pointer to struct fd_set, fd
 ;       returns: nothing
 ;
@@ -742,8 +623,8 @@ fdset:
         push ebp
         mov ebp, esp
 
-        mov edx, [ebp+8]
-        mov eax, [ebp+12]
+        mov edx, [ebp + 8]
+        mov eax, [ebp + 12]
         ; Save an additional copy of fd
         mov ecx, eax
 
@@ -759,7 +640,7 @@ fdset:
         xor eax, eax
         inc eax
         shl eax, cl
-        or [edx], eax
+        or [edx], eax  
 
         mov esp, ebp
         pop ebp
@@ -774,8 +655,8 @@ fdisset:
         push ebp
         mov ebp, esp
 
-        mov edx, [ebp+8]
-        mov eax, [ebp+12]
+        mov edx, [ebp + 8]
+        mov eax, [ebp + 12]
         mov ecx, eax
 
         shr eax, 5
@@ -819,8 +700,8 @@ kill_sockets:
         push ebp
         mov ebp, esp
 
-        mov esi, [ebp+8]
-        mov ecx, [ebp+12]
+        mov esi, [ebp + 8]
+        mov ecx, [ebp + 12]
 
         close_loop:
         lodsd 
@@ -846,9 +727,9 @@ sys_read:
         push ebx
 
         mov eax, 3
-        mov ebx, [ebp+8]
-        mov ecx, [ebp+12]
-        mov edx, [ebp+14]
+        mov ebx, [ebp + 8]
+        mov ecx, [ebp + 12]
+        mov edx, [ebp + 14]
         int 0x80
 
         pop ebx
@@ -867,9 +748,9 @@ sys_write:
         push ebx
 
         mov eax, 4
-        mov ebx, [ebp+8]
-        mov ecx, [ebp+12]
-        mov edx, [ebp+16]
+        mov ebx, [ebp + 8]
+        mov ecx, [ebp + 12]
+        mov edx, [ebp + 16]
         int 0x80
 
         pop ebx
@@ -888,7 +769,7 @@ sys_close:
         push ebx
         
         mov eax, 6
-        mov ebx, [ebp+8]
+        mov ebx, [ebp + 8]
         int 0x80
         
         pop ebx
@@ -913,7 +794,7 @@ sys_connect:
         ; takes as an argument a pointer to the arguments specific to the
         ; socket call we want to use, so load ecx with the address of the first
         ; argument on the stack
-        lea ecx, [ebp+8]
+        lea ecx, [ebp + 8]
         int 0x80
 
         pop edi
@@ -935,7 +816,7 @@ sys_socket:
 
         mov eax, 102
         mov ebx, 1
-        lea ecx, [ebp+8]
+        lea ecx, [ebp + 8]
         int 0x80
 
         pop edi
@@ -958,11 +839,11 @@ sys_select:
         push edi
 
         mov eax, 142
-        mov ebx, [ebp+8]
-        mov ecx, [ebp+12]
-        mov edx, [ebp+16]
-        mov esi, [ebp+20]
-        mov edi, [ebp+24]
+        mov ebx, [ebp + 8]
+        mov ecx, [ebp + 12]
+        mov edx, [ebp + 16]
+        mov esi, [ebp + 20]
+        mov edi, [ebp + 24]
         int 0x80
 
         pop edi
@@ -986,7 +867,7 @@ sys_sendto:
         ; sys_socketcall = 102
         mov eax, 102
         mov ebx, 11
-        lea ecx, [ebp+8] 
+        lea ecx, [ebp + 8] 
         int 0x80
 
         pop ebx
@@ -1008,12 +889,214 @@ sys_recvfrom:
         ; sys_socketcall = 102
         mov eax, 102
         mov ebx, 12
-        lea ecx, [ebp+8] 
+        lea ecx, [ebp + 8] 
         int 0x80
 
         pop ebx
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
+; ------------------------------------------------------------------------------
+; sys_setsockopt
+;       Set socket options
+;               Expects: socket, level, option_name, option_value, option_len
+sys_setsockopt:
+        push ebp
+        mov ebp, esp
+        push ebx
+        
+        mov eax, 102
+        mov ebx, 14
+        lea ecx, [ebp + 8]
+        int 0x80
+
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; fn_ping
+;       Send an ICMP Echo request to target host 
+;               Expects: pointer to sockaddr, sockaddr length
+;               Returns: latency in microseconds, or -1 if error
+fn_ping:
+        push ebp
+        mov ebp, esp
+        ; Allocate buffer for ICMP header and data, socket, timer, fdset
+        sub esp, (64 + 4 + 8 + 4 * 32)                     
+        push ebx
+        push edi
+        
+        ; Initialize "local" fdset on stack
+        push ebp
+        sub [esp], dword 204
+        call fdzero
+        add esp, 4
+
+        ; Build an ICMP packet with message type 8 (Echo request). The kernel will craft
+        ; the IP header for us because IP_HDRINCL is disabled by default
+        assemble_packet:
+        lea edi, [ebp - 64]             ; Point esi to start of packet
+        mov al, 8                       ; Type: 8 (Echo request)
+        stosb                           
+        xor al, al                      ; Code: 0 (Cleared for this type)
+        stosb                          
+        xor eax, eax                    ; Calculate ICMP checksum later
+        stosw                         
+        stosd                           ; Identifier: 0, Sequence number: 0
+        
+        ; Now we have to zero out 56 bytes of ICMP padding data
+        xor eax, eax                    
+        mov ecx, 14                     ; 56 bytes = 14 words
+        rep stosd                       ; Load 56 zero bytes
+
+        ; Calculate ICMP checksum which includes ICMP header and data
+        push dword (64/2)               ; Length of packet in words
+        push dword ebp                  ; Load pointer to packet on stack
+        sub [esp], dword 64
+        call cksum                     
+        add esp, 8                      ; Clean up stack
+        mov [ebp - 62], word ax         ; Inject checksum result into packet
+
+        ; To create a raw socket, user need root permissions
+        create_icmp_socket:
+        push dword 1                    ; Protocol: IPPROTO_ICMP
+        push dword (3 | 4000q)          ; Type: SOCK_RAW | O_NONBLOCK
+        push dword 2                    ; Domain: PF_INET
+        call sys_socket                 ; Create raw socket
+        add esp, 12                     ; Clean up stack
+        
+        ; Check return value
+        test eax, eax                   
+        js ping_socket_error
+
+        ; Store raw socket file descriptor
+        mov [ebp - 68], eax             
+        ; Initialize ping counter to 10. Try to ping this many times until we
+        ; get a response from the host (or give up)!
+        mov ebx, 10                             
+        jmp send_ping
+
+        ; On failure, exit with -1 in eax
+        ping_socket_error:
+        xor eax, eax                    ; Return -1 on error 
+        not eax
+        jmp ping_exit                   
+
+        ; Now we should be ready to send bytes to the other host 
+        send_ping:
+                ; Socket is in non-blocking mode, so we send and receieve data
+                ; asynchronously. In this case, send an ICMP Echo request, and block
+                ; until socket has data ready to be read.
+                push dword [ebp + 12]   ; Socket address length
+                push dword [ebp + 8]    ; Socket address
+                push dword 0            ; No flags
+                push dword 64           ; Packet length
+                push dword ebp          ; Packet start
+                sub [esp], dword 64     ; Packet start
+                push dword [ebp - 68]   ; Socket file descriptor
+                call sys_sendto         ; Send data asynchronously
+                add esp, 24             ; Clean up stack
+                
+                test eax, eax
+                jns recv_response       ; This shouldn't happen
+                cmp eax, -115           ; errno was EAGAIN as expected
+                je recv_response
+                cmp eax, -11            ; Or EINPROGRESS as expected
+                jne send_failed
+        
+                recv_response:
+                push dword [ebp + 12]   ; Address of socket address length
+                push dword [ebp + 8]    ; Socket address
+                push dword 0            ; No flags
+                push dword 0            ; Length of buffer 
+                push dword 0            ; Buffer (=NULL)
+                push dword [ebp - 68]   ; Socket
+                call sys_recvfrom       ; Receieve data asynchronously
+                add esp, 24             ; Clean up stack
+
+                test eax, eax
+                jns get_latency
+                cmp eax, -115
+                je get_latency
+                cmp eax, -11
+                je get_latency
+
+                recv_failed:
+                send_failed:
+                xor eax, eax            ; Save return value in eax
+                not eax
+                jmp ping_clean_up        
+
+        get_latency:
+        ; Timeout is an upper bound on how long to wait before select(2)
+        ; returns. Linux will adjust the timeval struct to reflect the time
+        ; remaining, this solution is is not portable, as the man page for
+        ; select(2) tells us to consider the value of the struct undefined
+        ; after select returns. 
+
+        ; Add socket to "local" fdset
+        push dword [ebp - 68]           
+        push ebp
+        sub [esp], dword 204
+        call fdset
+        add esp, 8                      ; Clean up stack
+        
+        ; Reset timer
+        mov [ebp - 72], dword 500000    ; Initialize timer to 0.5 seconds
+
+        push ebp                        ; Push timer on stack
+        sub [esp], dword 76
+        push dword 0                    ; Don't wait for exceptfds
+        push dword 0                    ; Don't wait for writefds
+        push ebp
+        sub [esp], dword 204
+        push dword [ebp - 68]           ; nfds = highest fd + 1
+        inc dword [esp]
+        call sys_select                 
+        add esp, 20                     ; Clean up stack
+
+        ; Check return value 
+        cmp eax, 0                      
+        je try_again                    ; Sockets did not respond to ICMP Echo request
+        test eax, eax
+        js ping_select_error            ; select(2) returned -errno in eax
+
+        jmp calculate_latency
+        
+        ; Should we try again?
+        try_again:
+        dec ebx                         ; Decrement ping "tries" counter
+        jz ping_select_error            ; We used up all 10 tries
+        jmp send_ping
+
+        ping_select_error:
+        xor eax, eax                    ; Save -1 as return value
+        not eax
+        jmp ping_clean_up
+
+        calculate_latency:
+        ; Now calculate the latency
+        mov eax, 500000
+        sub eax, [ebp - 72]
+
+        ping_clean_up:
+        push eax                        ; Save return value
+        push dword [ebp - 68]           ; Close "ping" socket                           
+        call sys_close
+        add esp, 4
+        pop eax                         ; Restore return value
+
+        ; eax should contain exit code
+        ping_exit:
+        pop edi
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+        
 ; ------------------------------------------------------------------------------
 ; EOF ==========================================================================
