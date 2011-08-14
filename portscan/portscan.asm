@@ -21,11 +21,8 @@ section .data
         recvfrom_error_msg:     db 'error: sys_recvfrom failed', 10, 0
         newline_msg:            db 10, 0
 
-        ; struct timeval {
-        ;     int tv_sec;     // seconds
-        ;     int tv_usec;    // microseconds
-        ; }; 
-        max_sockets             equ 64
+        ; A "master" copy of timeout: initialize it with some default value
+        timeout_master:         dd 0, 500000                  
 
         val_one:                dd 1
 
@@ -42,18 +39,22 @@ section .bss
         writefds:               resd 32                 ; Used as select(2) argument
         readfds:                resd 32                 ; Used as select(2) argument
 
-        sockarray:              resd max_sockets        ; Where we save all open sockets 
-        portsmap:               resw max_sockets        ; Each socket is mapped to a port
+        max_sockets             equ 64
+        socket_array:           resd max_sockets        ; Where we save all open sockets 
+        port_map:               resw max_sockets        ; Each socket is mapped to a port
         
         icmp_socket:            resd 1
 
         hostaddr:               resd 1                  ; Address of host in binary format octets
         myaddr:                 resd 1                  ; Address of localhost in binary format octets
 
-        portstr:                resb 12                 ; Temporary place where we store our strings
+        write_buffer:           resb 12                 ; Temporary place where we store our strings
 
+        ; struct timeval {
+        ;     int tv_sec;     // seconds
+        ;     int tv_usec;    // microseconds
+        ; }; 
         timeout_volatile:       resd 2                  ; Linux will mangle this after select(2) returns
-        timeout_master:         resd 2                  ; A "master" copy
         timeout_zero:           resd 2                  ; Leave as zero
 
         sendpacket:             resb 1024               ; Packet to be transmitted
@@ -85,7 +86,7 @@ parse_argv:
         mov esi, hostaddr           
         mov edi, sockaddr.sin_addr
         movsd
-        jmp ping_host
+        jmp check_user_id
 
         malformed_ip_error:
         ; The IPv4 address didn't look right
@@ -96,17 +97,16 @@ parse_argv:
         not ebx                         ; and turn on all the bits (ebx = -1)
         jmp exit                        ; Exit with error status 
 
-ping_host:
-        call icmp_echo
+check_user_id:
+        call sys_getuid
         cmp eax, 0
-        jne ping_failed
-        jmp tcp_scan
+        jz is_root
+        jmp not_root
 
-        ping_failed:
-        ; If ping failed, initialize timeout_master to some default value (0.5 sec)
-        mov [timeout_master + 4], dword 500000
+is_root:
+        call icmp_echo                  ; Dynamically set timeout
 
-tcp_scan:
+not_root:
         call connect_scan
         mov ebx, eax
 
@@ -481,7 +481,7 @@ kill_sockets:
         push ebp
         mov ebp, esp
 
-        mov esi, sockarray
+        mov esi, socket_array
         mov ecx, [ebp + 8]
 
         cmp ecx, 0
@@ -497,6 +497,24 @@ kill_sockets:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; sys_getuid
+;       Return the user ID of process
+;               Expects: nothing
+;               Returns: uid in eax
+sys_getuid:
+        push ebp
+        mov ebp, esp
+        
+        mov eax, 199
+        int 0x80
+
+        mov esp, ebp
+        pop ebp
+        ret
+
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
@@ -835,7 +853,7 @@ icmp_echo:
         ; Now calculate the latency
         mov eax, 500000
         sub eax, [timeout_volatile + 4]
-        shl eax, 2                              ; Adjust for "SYN-ACK" TCP handshake
+        shl eax, 3                              ; Adjust for "SYN-ACK" TCP handshake
         mov [timeout_master + 4], eax
         ; Close socket
         push dword [icmp_socket]
@@ -875,7 +893,7 @@ connect_scan:
         ; cdecl: ebx/esi/edi should always be perserved by the callee
         xor ebx, ebx 
         tcp_scan_loop: 
-                ; Reset index into sockets, portsmap
+                ; Reset index into sockets, port_map
                 xor esi, esi 
                 ; Store nfds (= 1 + maximum fd) for sys_select
                 xor edi, edi 
@@ -919,8 +937,8 @@ connect_scan:
 
                         save_socket:
                         ; Socket seems good, save it to our array and map the port 
-                        mov [sockarray + 4 * esi], eax 
-                        mov [portsmap + 2 * esi], word bx 
+                        mov [socket_array + 4 * esi], eax 
+                        mov [port_map + 2 * esi], word bx 
                         inc esi
                         ; Update nfds: max(nfds, fd)
                         cmp eax, edi
@@ -1025,7 +1043,7 @@ connect_scan:
                 iterate_through_fds:
                         check_if_write_blocks:
                         ; Fetch file descriptor
-                        mov eax, [sockarray + 4 * esi]
+                        mov eax, [socket_array + 4 * esi]
                         push eax
                         push writefds
                         call fdisset
@@ -1052,12 +1070,12 @@ connect_scan:
                         print_port:
                         ; We found an open port!
                         ; Convert the port number to a printable string
-                        movzx edx, word [portsmap + 2 * esi]
-                        push portstr
+                        movzx edx, word [port_map + 2 * esi]
+                        push write_buffer
                         push edx
                         call ultostr 
                         add esp, 8
-                        push dword portstr 
+                        push dword write_buffer 
                         call printstr 
                         ; Print new line after port
                         mov [esp], dword newline_msg
@@ -1091,4 +1109,13 @@ connect_scan:
         ret
 ; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
+; send_tcp_raw_syn
+;       Send a raw SYN packet to target host
+;               Expects: stack - nothing
+;                        sockaddr - points to target host
+;               Returns: 0 on success, -1 on error
+send_tcp_raw_syn:
+        ret
+; ------------------------------------------------------------------------------
 ; EOF ==========================================================================
