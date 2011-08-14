@@ -26,8 +26,6 @@ section .data
         ;     int tv_usec;    // microseconds
         ; }; 
         zerotimeout:            dd 0, 0         ; No wait
-        timeout_master:         dd 0, 500000    ; A "master" copy of timeout, provide it with 
-                                                ; a default value in case ping fails
         max_sockets             equ 64
 
         val_one:                dd 1
@@ -50,6 +48,7 @@ section .bss
         myaddr:                 resd 1                  ; Address of localhost in binary format octets
         portstr:                resb 12 
         timeout_volatile:       resd 2                  ; Linux will mangle this after select(2) returns
+        timeout_master:         resd 2                  ; A "master" copy
 
         iphdr:                  resb 20                 ; Pointer to start of packet
         iphdrlen                equ 84                  ; Total size of packet
@@ -96,10 +95,9 @@ ping_host:
         push dword sockaddr
         call fn_ping
         add esp, 8
-        
-        mov ebx, eax 
-        mov eax, 1
-        int 0x80
+        ; Adjust for connect time
+        shl eax, 2
+        mov [timeout_master + 4], eax
 
 ; ------------------------------------------------------------------------------
 
@@ -921,7 +919,7 @@ sys_setsockopt:
 ; fn_ping
 ;       Send an ICMP Echo request to target host 
 ;               Expects: pointer to sockaddr, sockaddr length
-;               Returns: latency in microseconds, or -1 if error
+;               Returns: latency in microseconds to use
 fn_ping:
         push ebp
         mov ebp, esp
@@ -982,8 +980,7 @@ fn_ping:
 
         ; On failure, exit with -1 in eax
         ping_socket_error:
-        xor eax, eax                    ; Return -1 on error 
-        not eax
+        mov eax, 500000
         jmp ping_exit                   
 
         ; Now we should be ready to send bytes to the other host 
@@ -1027,8 +1024,7 @@ fn_ping:
 
                 recv_failed:
                 send_failed:
-                xor eax, eax            ; Save return value in eax
-                not eax
+                mov eax, 500000
                 jmp ping_clean_up        
 
         get_latency:
@@ -1074,8 +1070,7 @@ fn_ping:
         jmp send_ping
 
         ping_select_error:
-        xor eax, eax                    ; Save -1 as return value
-        not eax
+        mov eax, 500000
         jmp ping_clean_up
 
         calculate_latency:
