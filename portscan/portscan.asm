@@ -11,20 +11,21 @@ section .data
                 .sin_addr:      dd 0            ; Load octets here after parsing
                 .sin_zero:      db 0,0,0,0,0,0,0,0
         sockaddrlen             equ $-sockaddr
-        sockaddrlen_addr        dd sockaddrlen  ; recvfrom(2) expects this as an address ?!
+        sockaddrlen_addr:       dd sockaddrlen  ; recvfrom(2) expects this as an address ?!
 
         socket_error_msg:       db 'error: sys_socket failed', 10, 0
         select_error_msg:       db 'error: sys_select failed', 10, 0
         parse_error_msg:        db 'error: Malformed IP address', 10, 0
         connect_error_msg:      db 'error: Unexpected connect error', 10, 0
         sendto_error_msg:       db 'error: sys_sendto failed', 10, 0
+        recvfrom_error_msg:     db 'error: sys_recvfrom failed', 10, 0
         newline_msg:            db 10, 0
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
         ; }; 
-        zerotimeout:             dd 0, 0         ; No wait
+        zerotimeout:            dd 0, 0         ; No wait
 
         max_sockets             equ 64
         icmphdr:                db 64           ; For sending "ping" packet           
@@ -119,7 +120,7 @@ create_icmp_socket:
         test eax, eax                   ; Check for return value
         js create_icmp_socket_error     ; If signed, then something went wrong
         mov [sockfds], eax              ; Otherwise, store the file descriptor in sockfds[0]
-        jmp send_ping                   ; Send a "ping" to host
+        jmp init_ping_tries             ; Send a "ping" to host
 
         ; We had socket troubles; does user have root permissions?
         create_icmp_socket_error:
@@ -130,6 +131,9 @@ create_icmp_socket:
         not ebx                         ; Convert -errno to errno
         inc ebx
         jmp exit                        ; Exit program
+
+init_ping_tries:
+mov ebx, 10                             ; If ping fails 10 times, bail out
         
 ; Now we should be ready to send bytes to the other host 
 send_ping:
@@ -144,6 +148,15 @@ send_ping:
         push dword [sockfds]            ; Socket
         call sys_sendto                 ; Send data asynchronously
         add esp, 24                     ; Clean up stack
+        
+        test eax, eax
+        jns recv_response
+        cmp eax, -115
+        je recv_response
+        cmp eax, -11
+        jne ping_failed
+
+        recv_response:
         push dword sockaddrlen_addr     ; Address of socket address length
         push dword sockaddr             ; Socket address
         push dword 0                    ; No flags
@@ -152,6 +165,13 @@ send_ping:
         push dword [sockfds]            ; Socket
         call sys_recvfrom               ; Receieve data asynchronously
         add esp, 24                     ; Clean up stack
+
+        test eax, eax
+        jns get_latency
+        cmp eax, -115
+        je get_latency
+        cmp eax, -11
+        jne ping_failed
 
 get_latency:
         ; Timeout is an upper bound on how long to wait before select(2)
@@ -176,9 +196,17 @@ get_latency:
         call sys_select                 
         add esp, 20                     ; Clean up stack
 
-        cmp eax, 0                      ; Sockets did not receive any data
-        jz send_ping                    ; Try again
+        cmp eax, 0                      ; Sockets did not receive ICMP response
+        jg calculate_latency            ; Calculate latency
+        test eax, eax
+        js ping_failed
+        
+        ; Should we try again?
+        dec ebx
+        jz ping_failed
+        jmp send_ping
 
+        calculate_latency:
         ; Now calculate the latency
         mov eax, 500000
         sub eax, [timeout_volatile + 4]
@@ -186,10 +214,13 @@ get_latency:
         shl eax, 2
         mov [timeout_master + 4], eax
 
+ping_failed:
         ; Close "ping" socket
         push dword [sockfds]
         call sys_close
         add esp, 4
+
+; ------------------------------------------------------------------------------
         
 ; Scan ports 0-1023, last port always stored in ebx
 ; cdecl: ebx/esi/edi should always be perserved by the callee
@@ -199,6 +230,10 @@ tcp_scan:
         xor esi, esi 
         ; Store nfds (= 1 + maximum fd) for sys_select
         xor edi, edi 
+        ; Reset writefds
+        push writefds
+        call fdzero
+        add esp, 4
         gather_sockets:
                 ; "Gather" sockets one by one using socket(3) and connect(3)
                 spawn_socket:
@@ -295,7 +330,7 @@ tcp_scan:
                 cmp esi, max_sockets
                 jl gather_sockets
 
-        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; ------------------------------------------------------------------------------
 
         wait_for_connections:
         ; Reset latency timer
@@ -345,7 +380,7 @@ tcp_scan:
         inc ebx
         jmp exit
 
-        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; ------------------------------------------------------------------------------
 
         check_for_connected_sockets:
         ; Check writefds for our sockets
@@ -401,7 +436,7 @@ tcp_scan:
                 cmp esi, max_sockets
                 jl iterate_through_fds
 
-        ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; ------------------------------------------------------------------------------
 
         free_sockets:
         ; Kill all the sockets we opened 
@@ -418,11 +453,6 @@ exit:
         mov ebp, esp
         mov eax, 1
         int 0x80
-
-; ------------------------------------------------------------------------------
-; new_raw_socket - Returnsa :q
-; ------------------------------------------------------------------------------
-
 
 ; ------------------------------------------------------------------------------
 ; cksum - IP header style checksum for given length in words (16-bit) 
@@ -479,6 +509,7 @@ printstr:
         ret                     ; Return
 ; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; strlen - calculate the length of null-terminated string
 ;       expects: string address
 ;       returns: length in eax
@@ -500,7 +531,9 @@ strlen:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; parse_octets - convert IPv4 address from text to binary form
 ;       expects: ip string, destination buffer
 ;       returns: 0 in eax, ~0 on error
@@ -592,7 +625,9 @@ parse_octets:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; strtoul - convert a number from text to binary form
 ;       expects: string address
 ;       returns: 32-bit unsigned integer in eax
@@ -620,7 +655,9 @@ strtoul:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; ultostr - convert an unsigned integer to a C string
 ;       expects: 32-bit unsigned integer, buffer 
 ;       returns: nothing
@@ -689,7 +726,9 @@ ultostr:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; fdset - add a file descriptor to struct fd_set
 ;       expects: pointer to struct fd_set, fd
 ;       returns: nothing
@@ -725,7 +764,9 @@ fdset:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; fdisset - check if a file descriptor is present in fd_set
 ;       expects: pointer to struct fd_set, fd
 ;       returns: 1 in eax, 0 otherwise
@@ -750,7 +791,9 @@ fdisset:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; fdzero - zero out an fd_set
 ;       expects: pointer to struct fd_set
 ;       returns: nothing
@@ -766,7 +809,9 @@ fdzero:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; kill_sockets - close first n fd in the socket array 
 ;       expects: array, n
 ;       returns: nothing
@@ -789,7 +834,9 @@ kill_sockets:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_read - read from file
 ;       expects: fd, buffer, buffer len
 ;       returns: number of bytes read, or -errno
@@ -808,7 +855,9 @@ sys_read:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_write - write to file
 ;       expects: fd, buffer, buffer len
 ;       returns: number of bytes written, or -errno
@@ -827,7 +876,9 @@ sys_write:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_close - close a file descriptor
 ;       expects: file descriptor
 ;       returns: 0 in eax | -errno in eax if error
@@ -844,7 +895,9 @@ sys_close:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_connect - connect a socket       
 ;       expects: int socket, address, address length
 ;       returns: 0 in eax or -errno on error
@@ -868,7 +921,9 @@ sys_connect:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_socket - create a socket       
 ;       expects: int domain, int type, int protocol
 ;       returns: 0 in eax or -errno on error
@@ -888,7 +943,9 @@ sys_socket:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_select - wrapper around sys_select
 ;       expects: int nfds, fd_set *readfds, fd_set *writefds,
 ;                fd_set *exceptfds, struct timeval *timeout
@@ -914,7 +971,9 @@ sys_select:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_sendto 
 ;       Send a packet to target host
 ;               Expects: socket, buffer, length, flags, sockaddr, sockaddrlen
@@ -934,7 +993,9 @@ sys_sendto:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
 
+; ------------------------------------------------------------------------------
 ; sys_recvfrom 
 ;       Receieve a packet from target host
 ;               Expects: socket, buffer, length, flags, sockaddr, sockaddrlen
@@ -954,3 +1015,5 @@ sys_recvfrom:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
+; EOF ==========================================================================
