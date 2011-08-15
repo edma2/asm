@@ -36,6 +36,7 @@ section .bss
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
+        ; These are accessed globally and as function parameters
         writefds:               resd 32                 ; Used as select(2) argument
         readfds:                resd 32                 ; Used as select(2) argument
 
@@ -45,7 +46,7 @@ section .bss
         
         icmp_socket:            resd 1
 
-        hostaddr:               resd 1                  ; Address of host in binary format octets
+        victimaddr:             resd 1                  ; Address of host in binary format octets
         myaddr:                 resd 1                  ; Address of localhost in binary format octets
 
         write_buffer:           resb 12                 ; Temporary place where we store our strings
@@ -54,11 +55,14 @@ section .bss
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
         ; }; 
-        timeout_volatile:       resd 2                  ; Linux will mangle this after select(2) returns
+        ; This can be mangled by us or the kernel at any time!
+        timeout_volatile:       resd 2                  
         timeout_zero:           resd 2                  ; Leave as zero
 
-        sendpacket:             resb 1024               ; Packet to be transmitted
+        sendpacket:             resb 1024               ; Packet to be sent
+        sendpacketlen:          resd 1                  ; Length of packet to be sent
         recvpacket:             resb 1024               ; Data received
+        recvpacketlen:          resd 1                  ; Length of packet to be received
 
         iphdrlen                equ 20                  ; Length of IP header
         icmphdrlen              equ 8                   ; Length of ICMP header
@@ -75,7 +79,7 @@ _start:
 parse_argv:
         ; Parse command line arguments into valid octets
         ; Usage: portscan <host ip>
-        push dword hostaddr             ; Load destination address
+        push dword victimaddr             ; Load destination address
         push dword [ebp + 8]            ; Load first argument argv[1]
         call parse_octets               ; Parse destination address
         add esp, 8                      ; Clean up stack
@@ -83,7 +87,7 @@ parse_argv:
         js malformed_ip_error           ; User invoked program incorrectly
         load_socket_address: 
         ; IPv4 address was valid; load sockaddr->sin_addr 
-        mov esi, hostaddr           
+        mov esi, victimaddr           
         mov edi, sockaddr.sin_addr
         movsd
         jmp check_user_id
@@ -105,6 +109,13 @@ check_user_id:
 
 is_root:
         call icmp_echo                  ; Dynamically set timeout
+        ; Extract our own IP address
+        lea esi, [recvpacket + 16]
+        mov edi, myaddr
+        movsd
+        call connect_scan
+        mov ebx, eax
+        jmp exit
 
 not_root:
         call connect_scan
@@ -391,15 +402,10 @@ ultostr:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; fdset - add or remove file descriptor to struct fd_set
-;       expects: pointer to struct fd_set, fd
-;       returns: nothing
-;
-; description:
-; Here we roll our own struct fd_set that the kernel uses as an interface for
-; select(2). struct fd_set is implemented as a bit array, composed of 32-bit
-; ints, and every possible file descriptor is mapped to a bit position.
-; e.g. (31|30|29|...|1|0) (63|62|61|...|33|32) ...
+; fdset 
+;       If fd is present in fdset, remove it, otherwise add it to fdset
+;               Expects: &fdset, fd
+;               Returns: nothing
 fdset:
         push ebp
         mov ebp, esp
@@ -421,7 +427,7 @@ fdset:
         xor eax, eax
         inc eax
         shl eax, cl
-        or [edx], eax  
+        xor [edx], eax  
 
         mov esp, ebp
         pop ebp
@@ -723,8 +729,8 @@ sys_setsockopt:
 ;               Expects: stack - nothing
 ;                        sockaddr - pointing to target host 
 ;               Returns: eax - 0 on success, -1 on error
-;                        timeout_master - 4*RRT latency in microseconds
-;                        recvpacket - received data
+;                        timeout_master - 8*RRT latency (usec)
+;                        recvpacket - ICMP Echo reply packet
 icmp_echo:
         push ebx
         push edi
@@ -732,7 +738,7 @@ icmp_echo:
         build_icmp_packet:
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
         ; will craft the IP header for us because IP_HDRINCL is disabled by
-        ; default, so don't include the IP header.
+        ; default, so we don't build the IP header.
         mov edi, sendpacket             ; Point esi to start of packet
         mov al, 8                       ; Type: 8 (Echo request)
         stosb                           
@@ -745,6 +751,7 @@ icmp_echo:
         xor eax, eax                    
         mov ecx, 14                     ; 56 bytes = 14 words
         rep stosd                       ; Load 56 zero bytes
+        mov [sendpacketlen], dword (icmphdrlen + 56)
 
         calculate_icmp_checksum:
         ; Calculate ICMP checksum which includes ICMP header and data
@@ -775,7 +782,6 @@ icmp_echo:
         store_icmp_socket:
         ; Store raw socket file descriptor in icmp_socket
         mov [icmp_socket], eax             
-        jmp send_icmp_packet
 
         send_icmp_packet:
         ; Now we should be ready to send bytes to the other host 
@@ -787,48 +793,38 @@ icmp_echo:
                 ; asynchronously. In this case, send an ICMP Echo request, and block
                 ; until socket has data ready to be read.
                 icmp_request:
-                push dword sockaddrlen          ; Socket address length
-                push dword sockaddr             ; Socket address
-                push dword 0                    ; No flags
-                push dword (icmphdrlen+56)       
-                push dword sendpacket           ; Packet start
                 push dword [icmp_socket]
-                call sys_sendto                 ; Send data asynchronously
-                add esp, 24            
+                call send_packet
+                add esp, 4
+
                 ; Check return value
                 test eax, eax
-                jns icmp_select_timeout         ; Send finished immediately (!)
+                jns check_response_time         ; Send finished immediately (!)
                 cmp eax, -115                   ; EAGAIN - send in progress
-                je icmp_select_timeout
+                je check_response_time
                 cmp eax, -11                    ; EINPROGRESS - send in progress
-                je icmp_select_timeout
+                je check_response_time
                 jmp icmp_echo_try_again
 
-                icmp_select_timeout:
+                check_response_time:
                 ; Timeout is an upper bound on how long to wait before select(2)
                 ; returns. Linux will adjust the timeval struct to reflect the time
                 ; remaining, this solution is is not portable, as the man page for
                 ; select(2) tells us to consider the value of the struct undefined
                 ; after select returns. 
-                push dword [icmp_socket]        ; Add socket to readfds
-                push readfds
-                call fdset
-                add esp, 8                      
-                
-                ; Reset timer; initialize timer to 0.5 seconds
-                mov [timeout_volatile + 4], dword 500000 
-                push dword timeout_volatile     ; Push timer on stack
-                push dword 0                    ; Don't wait for exceptfds
-                push dword 0                    ; Don't wait for writefds
-                push dword readfds              ; Block until read is ready
-                push dword [icmp_socket]        ; nfds = highest fd + 1
-                inc dword [esp]
-                call sys_select                 
-                add esp, 20                     ; Clean up stack
+                push dword [icmp_socket]
+                push dword 500000
+                call time_read_response
+                add esp, 8
+
                 ; Check return value 
-                cmp eax, 0                      
-                jle icmp_echo_try_again         ; Sockets did not respond to ICMP Echo request
-                jmp icmp_select_ready           ; Ping was successful
+                test eax, eax                      
+                ; Socket was not ready by the time select returned, or select failed
+                js icmp_echo_try_again          
+                ; Multiply response time by 8 to estimate time it would take for halfway connect to finish
+                shl eax, 3                      
+                mov [timeout_master + 4], eax       ; Save response time in timeout_master
+                jmp icmp_recv_reply
                 
                 ; Should we try again?
                 icmp_echo_try_again:
@@ -836,25 +832,17 @@ icmp_echo:
                 jz icmp_echo_failed             ; We used up all 10 tries
                 jmp send_icmp_packet_loop       ; Try again
 
-        icmp_select_ready:
-        ; Receive the ICMP Echo request packet
-        push dword sockaddrlen_addr             ; Address of socket address length
-        push dword sockaddr                     ; Socket address
-        push dword 0                            ; No flags
-        push dword (iphdrlen+icmphdrlen+56)    
-        push dword recvpacket 
+        icmp_recv_reply:
+        ; Set number of bytes we expect to receive in packet
+        mov [recvpacketlen], dword (iphdrlen+icmphdrlen+56)
         push dword [icmp_socket]
-        call sys_recvfrom                       ; Receieve data asynchronously
-        add esp, 24             
+        call recv_packet
+        add esp, 4
+
         ; Check return value
         test eax, eax
         js icmp_echo_failed
 
-        ; Now calculate the latency
-        mov eax, 500000
-        sub eax, [timeout_volatile + 4]
-        shl eax, 3                              ; Adjust for "SYN-ACK" TCP handshake
-        mov [timeout_master + 4], eax
         ; Close socket
         push dword [icmp_socket]
         call sys_close
@@ -872,7 +860,7 @@ icmp_echo:
         xor eax, eax
         not eax
 
-        icmp_echo_exit:
+icmp_echo_exit:
         pop edi
         pop ebx
         ret
@@ -1110,6 +1098,126 @@ connect_scan:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
+; send_packet
+;       Send a packet to target host
+;               Expects: stack - socket
+;                        sockaddr - points to target host
+;                        sendpacket - filled out for us
+;                        sendpacketlen - filled out for us
+;               Returns: number of bytes sent, or -errno
+send_packet:
+        push ebp
+        mov ebp, esp
+        
+        push dword sockaddrlen          ; Socket address length
+        push dword sockaddr             ; Socket address
+        push dword 0                    ; No flags
+        push dword [sendpacketlen]      ; Number of bytes to send
+        push dword sendpacket           ; Packet start
+        push dword [ebp + 8]            ; Socket
+        call sys_sendto                 ; Send data asynchronously
+        add esp, 24            
+
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; recv_packet
+;       Receive a packet from target host
+;               Expects: stack - socket
+;                        sockaddr - points to target host
+;                        recvpacket - filled out for us
+;                        recvpacketlen - filled out for us
+;               Returns: number of bytes received, or -errno
+recv_packet:
+        push ebp
+        mov ebp, esp
+        
+        push dword sockaddrlen_addr     ; Socket address length
+        push dword sockaddr             ; Socket address
+        push dword 0                    ; No flags
+        push dword [recvpacketlen]      ; Socket
+        push dword recvpacket           ; Packet start
+        push dword [ebp + 8]            ; Socket
+        call sys_recvfrom               ; Send data asynchronously
+        add esp, 24            
+
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; time_read_response
+;       Given a socket, return the time elapsed until data is ready to be read from it
+;               Expects: stack - timeout (usec), socket
+;               Returns: eax - response time (usec), or -1 on error or timeout exceeded
+time_read_response:
+        push ebp
+        mov ebp, esp
+        ; local "timer"
+        sub esp, 8      
+        push edi
+
+        ; Add socket to readfds
+        push dword [ebp + 12]           
+        push readfds
+        call fdset
+        add esp, 8                      
+
+        ; We reserved space for a struct timeval in local storage
+        ; Initialize timeval.usec to maximum timeout argument
+        lea edi, [ebp - 8]
+        xor eax, eax
+        stosd
+        mov eax, [ebp + 8]
+        stosd
+
+        ; Block until data is ready to be read, or we exceed timeout
+        lea eax, [ebp - 8]              ; Load local timer on stack
+        push eax
+        push dword 0                    ; Don't wait for exceptfds
+        push dword 0                    ; Don't wait for writefds
+        push dword readfds              ; Block until read is ready
+        push dword [ebp + 12]           ; nfds = highest fd + 1
+        inc dword [esp]
+        call sys_select                 
+        add esp, 16                     ; Clean up stack, preserve "timer"
+
+        ; Check return value
+        cmp eax, 0
+        jz not_ready
+        js select_failed
+
+        ; Calculate response time (usecs)
+        mov eax, [ebp + 8]
+        sub eax, [ebp - 4]
+        ; Restore readfds 
+        push eax
+        push dword [ebp + 12]           
+        push readfds
+        call fdset
+        add esp, 8                      
+        pop eax
+        jmp time_read_response_exit
+        
+        ; Return -1 in eax if timeout exceeded or select failed
+        select_failed:
+        not_ready:
+        xor eax, eax
+        not eax
+        
+        time_read_response_exit:
+        pop edi
+        mov esp, ebp
+        pop ebp
+        ret
+
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
 ; send_tcp_raw_syn
 ;       Send a raw SYN packet to target host
 ;               Expects: stack - nothing
@@ -1118,4 +1226,7 @@ connect_scan:
 send_tcp_raw_syn:
         ret
 ; ------------------------------------------------------------------------------
+
+syn_scan:
+        ret
 ; EOF ==========================================================================
