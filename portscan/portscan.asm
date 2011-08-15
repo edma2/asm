@@ -139,6 +139,22 @@ get_default_timeout:
 ping_host:
         ;;; Ping the host using ICMP echo, and wait for an ICMP request packet ;;;
 
+        create_icmp_socket:
+        ; To create a raw socket, user need root permissions
+        ; IPPROTO_ICMP, SOCK_RAW|O_NONBLOCK, PF_INET
+        push dword 1                    
+        push dword (3 | 4000q)         
+        push dword 2                  
+        call sys_socket                 
+        add esp, 12                  
+
+        ; Check return value
+        test eax, eax                   
+        ; Give up immediately if we couldn't create an icmp socket
+        js set_default_timeout
+        ; Store the raw socket file descriptor in icmp_socket
+        mov [icmp_socket], eax             
+
         build_icmp_packet:
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
         ; will craft the IP header for us because IP_HDRINCL is disabled by
@@ -170,23 +186,7 @@ ping_host:
         ; the packet.
         mov [sendpacketlen], dword (icmphdrlen + 56)
 
-        create_icmp_socket:
-        ; To create a raw socket, user need root permissions
-        ; IPPROTO_ICMP, SOCK_RAW|O_NONBLOCK, PF_INET
-        push dword 1                    
-        push dword (3 | 4000q)         
-        push dword 2                  
-        call sys_socket                 
-        add esp, 12                  
-
-        ; Check return value
-        test eax, eax                   
-        ; Give up immediately if we couldn't create an icmp socket
-        js set_default_timeout
-        ; Store the raw socket file descriptor in icmp_socket
-        mov [icmp_socket], eax             
-
-        ;;; Send the packet thrice through the ICMP socket we just created ;;;
+        ;;; Send the packet thrice through the created ICMP socket ;;;
 
         mov ebx, 3                             
         ; Socket is in non-blocking mode, so we send and receieve data
@@ -239,7 +239,6 @@ ping_host:
         push dword [icmp_socket]
         call recv_packet
         add esp, 4
-
         ; Save return value of recv_packet
         push eax
         ; We're done with the socket
@@ -750,7 +749,7 @@ ultostr:
 
 ; ------------------------------------------------------------------------------
 ; fdset 
-;       If fd is present in fdset, remove it, otherwise add it to fdset
+;       Add fd to fdset
 ;               Expects: &fdset, fd
 ;               Returns: nothing
 fdset:
@@ -774,7 +773,7 @@ fdset:
         xor eax, eax
         inc eax
         shl eax, cl
-        xor [edx], eax  
+        or [edx], eax  
 
         mov esp, ebp
         pop ebp
