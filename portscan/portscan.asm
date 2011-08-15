@@ -792,7 +792,7 @@ icmp_echo:
                 ; Socket is in non-blocking mode, so we send and receieve data
                 ; asynchronously. In this case, send an ICMP Echo request, and block
                 ; until socket has data ready to be read.
-                icmp_request:
+                icmp_send_request:
                 push dword [icmp_socket]
                 call send_packet
                 add esp, 4
@@ -1090,6 +1090,10 @@ connect_scan:
                 xor eax, eax
         
         connect_scan_exit:
+        ; Reset writefds
+        push writefds
+        call fdzero
+        add esp, 4
         ; All done
         pop edi
         pop esi
@@ -1191,16 +1195,14 @@ time_read_response:
         jz not_ready
         js select_failed
 
-        ; Calculate response time (usecs)
-        mov eax, [ebp + 8]
-        sub eax, [ebp - 4]
         ; Restore readfds 
-        push eax
         push dword [ebp + 12]           
         push readfds
         call fdset
         add esp, 8                      
-        pop eax
+        ; Calculate response time (usecs)
+        mov eax, [ebp + 8]
+        sub eax, [ebp - 4]
         jmp time_read_response_exit
         
         ; Return -1 in eax if timeout exceeded or select failed
