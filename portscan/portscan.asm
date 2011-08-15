@@ -104,22 +104,233 @@ parse_argv:
 check_user_id:
         call sys_getuid
         cmp eax, 0
-        jz is_root
+        jz isr00t
         jmp not_root
 
-is_root:
+isr00t:
         call icmp_echo                  ; Dynamically set timeout
         ; Extract our own IP address
         lea esi, [recvpacket + 16]
         mov edi, myaddr
         movsd
-        call connect_scan
-        mov ebx, eax
-        jmp exit
+        jmp connect_scan
 
 not_root:
-        call connect_scan
-        mov ebx, eax
+        jmp connect_scan
+
+; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
+connect_scan:
+        ; Scan ports 0-1023, last port always stored in ebx
+        ; cdecl: ebx/esi/edi should always be perserved by the callee
+        xor ebx, ebx 
+        connect_scan_loop: 
+                ; Reset index into sockets, port_map
+                xor esi, esi 
+                ; Store nfds (= 1 + maximum fd) for sys_select
+                xor edi, edi 
+                ; Reset writefds (just in case)
+                push writefds
+                call fdzero
+                add esp, 4
+                gather_sockets:
+                        ; "Gather" sockets one by one using socket(3) and connect(3)
+                        spawn_socket:
+                        ; Call sys_socket with arguments
+                        ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
+                        push dword 6 
+                        push dword (1 | 4000q) 
+                        push dword 2 
+                        call sys_socket
+                        add esp, 12
+
+                        ; Check return value
+                        test eax, eax
+                        ; sys_socket failed with -errno
+                        js socket_create_error 
+                        jmp save_socket
+
+                        socket_create_error:
+                        ; We had trouble creating the socket
+                        ; Save -errno on stack
+                        push eax 
+                        ; We should close(3) all our open sockets
+                        ; esi should contain count of open sockets
+                        push esi
+                        call kill_sockets
+                        add esp, 4
+                        ; Print socket error message 
+                        push socket_error_msg
+                        call printstr
+                        add esp, 4
+                        ; Save -errno in eax before exiting
+                        pop eax 
+                        jmp exit
+
+                        save_socket:
+                        ; Socket seems good, save it to our array and map the port 
+                        mov [socket_array + 4 * esi], eax 
+                        mov [port_map + 2 * esi], word bx 
+                        inc esi
+                        ; Update nfds: max(nfds, fd)
+                        cmp eax, edi
+                        cmovg edi, eax
+                        ; Add socket to writefds
+                        push eax
+                        push writefds
+                        call fdset
+                        add esp, 4
+                        pop eax 
+
+                        attempt_connect:
+                        ; Initiate TCP handshake to port
+                        ; Load port to sockaddr struct in htons() order
+                        mov [sockaddr.sin_port], byte bh 
+                        mov [sockaddr.sin_port + 1], byte bl 
+                        push sockaddrlen
+                        push sockaddr        
+                        push eax 
+                        call sys_connect
+                        add esp, 12
+
+                        check_errno:
+                        ; We expect to see EAGAIN or EINPROGRESS
+                        cmp eax, -115
+                        je connect_in_progress
+                        cmp eax, -11
+                        je connect_in_progress
+                        cmp eax, 0
+                        ; This would be very unexpected!
+                        je connect_complete
+
+                        wrong_errno:
+                        ; Connect failed for reasons other than being "in progress"
+                        ; Save -errno on stack
+                        push eax 
+                        push esi
+                        call kill_sockets
+                        add esp, 4
+                        push connect_error_msg
+                        call printstr
+                        add esp, 4
+                        pop eax
+                        jmp exit
+
+                        connect_complete:
+                        connect_in_progress:
+                        ; "Gather" next socket-port combination or proceed to next step
+                        inc word bx
+                        cmp esi, max_sockets
+                        jl gather_sockets
+
+                wait_for_connections:
+                ; Copy timeout_master to timeout_volatile
+                lea esi, [timeout_master + 4]
+                lea edi, [timeout_volatile + 4]
+                movsd
+                ; Wait for requested connects to finish
+                push timeout_volatile
+                push dword 0
+                push dword 0
+                push dword 0
+                push dword 0
+                call sys_select
+                add esp, 20
+
+                call_select: 
+                ; Wake up and smell the ashes...
+                ; Time to check up on our sockets
+                push timeout_zero
+                push dword 0
+                push dword writefds
+                push dword 0
+                ; nfds = maximum fd + 1
+                inc edi 
+                push edi
+                call sys_select
+                add esp, 20
+
+                cmp eax, 0
+                ; All sockets will block on write, skip to next iteration
+                je free_sockets
+                jns check_for_connected_sockets 
+
+                select_error:
+                ; We had some sort of trouble with select(2)
+                ; Save -errno on stack and kill all sockets
+                push eax
+                push dword max_sockets
+                call kill_sockets
+                add esp, 4
+                push select_error_msg
+                call printstr
+                add esp, 4
+                pop eax
+                jmp exit
+
+                check_for_connected_sockets:
+                ; Check writefds for our sockets
+                ; Reset index into socket array
+                xor esi, esi
+                iterate_through_fds:
+                        check_if_write_blocks:
+                        ; Fetch file descriptor
+                        mov eax, [socket_array + 4 * esi]
+                        push eax
+                        push writefds
+                        call fdisset
+                        add esp, 4
+                        cmp eax, 0
+                        pop eax
+                        ; This port didn't respond to our TCP request:
+                        ; this means it was probably filtered
+                        je port_was_filtered 
+
+                        send_empty_packet:
+                        ; Seems like the socket can be written to
+                        ; Let's try to send an empty dud packet to the host
+                        push dword 0
+                        push dword 0
+                        push eax
+                        call sys_write
+                        add esp, 12 
+                        test eax, eax
+                        ; We had trouble sending: 
+                        ; the port was probably closed
+                        js port_was_closed
+                        
+                        print_port:
+                        ; We found an open port!
+                        ; Convert the port number to a printable string
+                        movzx edx, word [port_map + 2 * esi]
+                        push write_buffer
+                        push edx
+                        call ultostr 
+                        add esp, 8
+                        push dword write_buffer 
+                        call printstr 
+                        ; Print new line after port
+                        mov [esp], dword newline_msg
+                        call printstr
+                        add esp, 4
+                        jmp check_next_socket
+
+                        port_was_filtered:
+                        port_was_closed:
+                        check_next_socket:
+                        inc esi
+                        cmp esi, max_sockets
+                        jl iterate_through_fds
+
+                free_sockets:
+                ; Kill all the sockets we opened 
+                push dword max_sockets
+                call kill_sockets
+                add esp, 4
+                ; Check if we're done
+                cmp bx, word 1024 
+                jl connect_scan_loop
+                ; Return 0 in eax because we finished scanning
+                xor eax, eax
 
 exit:
         ; We expect ebx to contain exit status 
@@ -823,7 +1034,7 @@ icmp_echo:
                 js icmp_echo_try_again          
                 ; Multiply response time by 8 to estimate time it would take for halfway connect to finish
                 shl eax, 3                      
-                mov [timeout_master + 4], eax       ; Save response time in timeout_master
+                mov [timeout_master + 4], eax   ; Save response time in timeout_master
                 jmp icmp_recv_reply
                 
                 ; Should we try again?
@@ -862,241 +1073,6 @@ icmp_echo:
 
 icmp_echo_exit:
         pop edi
-        pop ebx
-        ret
-; ------------------------------------------------------------------------------
-
-; ------------------------------------------------------------------------------
-; connect_scan
-;       Attempt to establish TCP connections for ports 0-1023, printing port if successful 
-;               Expects: timeout_master - set by ping
-;                        sockaddr - pointing to target host
-;               Returns: eax - 0 on success, -errno on error
-connect_scan:
-        push ebx
-        push esi
-        push edi
-
-        ; Scan ports 0-1023, last port always stored in ebx
-        ; cdecl: ebx/esi/edi should always be perserved by the callee
-        xor ebx, ebx 
-        tcp_scan_loop: 
-                ; Reset index into sockets, port_map
-                xor esi, esi 
-                ; Store nfds (= 1 + maximum fd) for sys_select
-                xor edi, edi 
-                ; Reset writefds
-                push writefds
-                call fdzero
-                add esp, 4
-                gather_sockets:
-                        ; "Gather" sockets one by one using socket(3) and connect(3)
-                        spawn_socket:
-                        ; Call sys_socket with arguments
-                        ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
-                        push dword 6 
-                        push dword (1 | 4000q) 
-                        push dword 2 
-                        call sys_socket
-                        add esp, 12
-
-                        ; Check return value
-                        test eax, eax
-                        ; sys_socket failed with -errno
-                        js socket_create_error 
-                        jmp save_socket
-
-                        socket_create_error:
-                        ; We had trouble creating the socket
-                        ; Save -errno on stack
-                        push eax 
-                        ; We should close(3) all our open sockets
-                        ; esi should contain count of open sockets
-                        push esi
-                        call kill_sockets
-                        add esp, 4
-                        ; Print socket error message 
-                        push socket_error_msg
-                        call printstr
-                        add esp, 4
-                        ; Save -errno in eax before exiting
-                        pop eax 
-                        jmp connect_scan_exit
-
-                        save_socket:
-                        ; Socket seems good, save it to our array and map the port 
-                        mov [socket_array + 4 * esi], eax 
-                        mov [port_map + 2 * esi], word bx 
-                        inc esi
-                        ; Update nfds: max(nfds, fd)
-                        cmp eax, edi
-                        cmovg edi, eax
-                        ; Add socket to writefds
-                        push eax
-                        push writefds
-                        call fdset
-                        add esp, 4
-                        pop eax 
-
-                        attempt_connect:
-                        ; Initiate TCP handshake to port
-                        ; Load port to sockaddr struct in htons() order
-                        mov [sockaddr.sin_port], byte bh 
-                        mov [sockaddr.sin_port + 1], byte bl 
-                        push sockaddrlen
-                        push sockaddr        
-                        push eax 
-                        call sys_connect
-                        add esp, 12
-
-                        check_errno:
-                        ; We expect to see EAGAIN or EINPROGRESS
-                        cmp eax, -115
-                        je connect_in_progress
-                        cmp eax, -11
-                        je connect_in_progress
-                        cmp eax, 0
-                        ; This would be very unexpected!
-                        je connect_complete
-
-                        wrong_errno:
-                        ; Connect failed for reasons other than being "in progress"
-                        ; Save -errno on stack
-                        push eax 
-                        push esi
-                        call kill_sockets
-                        add esp, 4
-                        push connect_error_msg
-                        call printstr
-                        add esp, 4
-                        pop eax
-                        jmp connect_scan_exit
-
-                        connect_complete:
-                        connect_in_progress:
-                        ; "Gather" next socket-port combination or proceed to next step
-                        inc word bx
-                        cmp esi, max_sockets
-                        jl gather_sockets
-
-                wait_for_connections:
-                ; Copy timeout_master to timeout_volatile
-                lea esi, [timeout_master + 4]
-                lea edi, [timeout_volatile + 4]
-                movsd
-                ; Wait for requested connects to finish
-                push timeout_volatile
-                push dword 0
-                push dword 0
-                push dword 0
-                push dword 0
-                call sys_select
-                add esp, 20
-
-                call_select: 
-                ; Wake up and smell the ashes...
-                ; Time to check up on our sockets
-                push timeout_zero
-                push dword 0
-                push dword writefds
-                push dword 0
-                ; nfds = maximum fd + 1
-                inc edi 
-                push edi
-                call sys_select
-                add esp, 20
-
-                cmp eax, 0
-                ; All sockets will block on write, skip to next iteration
-                je free_sockets
-                jns check_for_connected_sockets 
-
-                select_error:
-                ; We had some sort of trouble with select(2)
-                ; Save -errno on stack and kill all sockets
-                push eax
-                push dword max_sockets
-                call kill_sockets
-                add esp, 4
-                push select_error_msg
-                call printstr
-                add esp, 4
-                pop eax
-                jmp connect_scan_exit
-
-                check_for_connected_sockets:
-                ; Check writefds for our sockets
-                ; Reset index into socket array
-                xor esi, esi
-                iterate_through_fds:
-                        check_if_write_blocks:
-                        ; Fetch file descriptor
-                        mov eax, [socket_array + 4 * esi]
-                        push eax
-                        push writefds
-                        call fdisset
-                        add esp, 4
-                        cmp eax, 0
-                        pop eax
-                        ; This port didn't respond to our TCP request:
-                        ; this means it was probably filtered
-                        je port_was_filtered 
-
-                        send_empty_packet:
-                        ; Seems like the socket can be written to
-                        ; Let's try to send an empty dud packet to the host
-                        push dword 0
-                        push dword 0
-                        push eax
-                        call sys_write
-                        add esp, 12 
-                        test eax, eax
-                        ; We had trouble sending: 
-                        ; the port was probably closed
-                        js port_was_closed
-                        
-                        print_port:
-                        ; We found an open port!
-                        ; Convert the port number to a printable string
-                        movzx edx, word [port_map + 2 * esi]
-                        push write_buffer
-                        push edx
-                        call ultostr 
-                        add esp, 8
-                        push dword write_buffer 
-                        call printstr 
-                        ; Print new line after port
-                        mov [esp], dword newline_msg
-                        call printstr
-                        add esp, 4
-                        jmp check_next_socket
-
-                        port_was_filtered:
-                        port_was_closed:
-                        check_next_socket:
-                        inc esi
-                        cmp esi, max_sockets
-                        jl iterate_through_fds
-
-                free_sockets:
-                ; Kill all the sockets we opened 
-                push dword max_sockets
-                call kill_sockets
-                add esp, 4
-                ; Check if we're done
-                cmp bx, word 1024 
-                jl tcp_scan_loop
-                ; Return 0 in eax because we finished scanning
-                xor eax, eax
-        
-        connect_scan_exit:
-        ; Reset writefds
-        push writefds
-        call fdzero
-        add esp, 4
-        ; All done
-        pop edi
-        pop esi
         pop ebx
         ret
 ; ------------------------------------------------------------------------------
@@ -1161,30 +1137,36 @@ recv_packet:
 time_read_response:
         push ebp
         mov ebp, esp
-        ; local "timer"
-        sub esp, 8      
+        ; local "timer" + "readfds"
+        sub esp, (8+32*4)
+        push esi
         push edi
+
+        lea esi, [ebp - (8+32*4)] ; Set pointer to "readfds"
+        lea edi, [ebp - 8] ; Set pointer to "timer"
+
+        ; Zero out our temporary "readfds"
+        push esi
+        call fdzero
+        add esp, 4
 
         ; Add socket to readfds
         push dword [ebp + 12]           
-        push readfds
+        push esi
         call fdset
         add esp, 8                      
 
         ; We reserved space for a struct timeval in local storage
         ; Initialize timeval.usec to maximum timeout argument
-        lea edi, [ebp - 8]
-        xor eax, eax
-        stosd
+        mov [edi], dword 0
         mov eax, [ebp + 8]
-        stosd
+        mov [edi + 4], eax
 
         ; Block until data is ready to be read, or we exceed timeout
-        lea eax, [ebp - 8]              ; Load local timer on stack
-        push eax
+        push edi                        ; Load "timer"
         push dword 0                    ; Don't wait for exceptfds
         push dword 0                    ; Don't wait for writefds
-        push dword readfds              ; Block until read is ready
+        push esi                        ; Block until read is ready
         push dword [ebp + 12]           ; nfds = highest fd + 1
         inc dword [esp]
         call sys_select                 
@@ -1195,14 +1177,9 @@ time_read_response:
         jz not_ready
         js select_failed
 
-        ; Restore readfds 
-        push dword [ebp + 12]           
-        push readfds
-        call fdset
-        add esp, 8                      
         ; Calculate response time (usecs)
         mov eax, [ebp + 8]
-        sub eax, [ebp - 4]
+        sub eax, [edi + 4]
         jmp time_read_response_exit
         
         ; Return -1 in eax if timeout exceeded or select failed
@@ -1212,6 +1189,7 @@ time_read_response:
         not eax
         
         time_read_response_exit:
+        pop esi
         pop edi
         mov esp, ebp
         pop ebp
