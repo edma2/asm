@@ -159,11 +159,6 @@ ping_host:
         xor eax, eax                    
         mov ecx, 14                    
         rep stosd                       
-        ; Before sending/receiving packets, store the length after filling out
-        ; the packet.
-        mov [sendpacketlen], dword (icmphdrlen + 56)
-
-        calculate_icmp_checksum:
         ; Calculate ICMP checksum which includes ICMP header and data
         push dword ((icmphdrlen+56)/2)
         push dword sendpacket        
@@ -171,6 +166,9 @@ ping_host:
         add esp, 8                  
         ; Store result in packet ICMP header
         mov [sendpacket + 2], word ax   
+        ; Before sending/receiving packets, store the length after filling out
+        ; the packet.
+        mov [sendpacketlen], dword (icmphdrlen + 56)
 
         create_icmp_socket:
         ; To create a raw socket, user need root permissions
@@ -185,94 +183,75 @@ ping_host:
         test eax, eax                   
         ; Give up immediately if we couldn't create an icmp socket
         js set_default_timeout
-
-        store_icmp_socket:
         ; Store the raw socket file descriptor in icmp_socket
         mov [icmp_socket], eax             
 
-        ;;; Send the packet through the ICMP socket we just created ;;;
+        ;;; Send the packet thrice through the ICMP socket we just created ;;;
 
-        send_icmp_packet:
-        ; Try to ping 10 times until we get a response from the host
-        ; Use ebx because this register will not get clobbered as per cdecl
-        ; convention.
-        mov ebx, 10                             
-        send_icmp_packet_loop:
-                ; Socket is in non-blocking mode, so we send and receieve data
-                ; asynchronously. In this case, send an ICMP Echo request, and block
-                ; until socket has data ready to be read.
-                icmp_send_request:
+        mov ebx, 3                             
+        ; Socket is in non-blocking mode, so we send and receieve data
+        ; asynchronously. In this case, send 3 pings and block until socket has
+        ; data ready to be read.
+        send_ping_requests:
                 push dword [icmp_socket]
                 call send_packet
                 add esp, 4
+                dec ebx
+                jnz send_ping_requests
 
-                ; Check return value
-                test eax, eax
-                ; Packet sending finished immediately (!)
-                jns check_response_time        
-                ; EAGAIN - send in progress
-                cmp eax, -115                   
-                je check_response_time
-                ; EINPROGRESS - send in progress
-                cmp eax, -11                    
-                je check_response_time
-                jmp icmp_echo_try_again
+        ;;; Check how long it takes to get our first ICMP Echo response ;;;
 
-                check_response_time:
-                ; Timeout is an upper bound on how long to wait before select(2)
-                ; returns. Linux will adjust the timeval struct to reflect the time
-                ; remaining, this solution is is not portable, as the man page for
-                ; select(2) tells us to consider the value of the struct undefined
-                ; after select returns. 
-                push dword [icmp_socket]
-                push dword 500000
-                call time_read_response
-                add esp, 8
+        ; Timeout is an upper bound on how long to wait before select(2)
+        ; returns. Linux will adjust the timeval struct to reflect the time
+        ; remaining. Furthermore, we only care about the first reply we get,
+        ; and ignore the rest.
+        push dword [icmp_socket]
+        push dword 500000
+        call time_read_response
+        add esp, 8
 
-                ; Check return value 
-                test eax, eax                      
-                ; Socket was not ready by the time select returned, or select failed
-                js icmp_echo_try_again          
-                jmp store_response_time
+        ; Return value should contain time elapsed or -1 if select error'd out
+        ; or no sockets were ready to be read from.
+        test eax, eax                      
+        js ping_no_reply          
+        jmp ping_got_reply
+        
+        ping_no_reply:
+        ; Ping failed, close socket and set default timeout instead
+        push dword [icmp_socket]
+        call sys_close
+        add esp, 4
+        jmp set_default_timeout
 
-                ; Should we try again?
-                icmp_echo_try_again:
-                dec ebx                         
-                ; Used up all 10 tries
-                jz ping_host_failed            
-                jmp send_icmp_packet_loop     
+        ;;; Receieve data and calculate packet delay ;;;
 
-        store_response_time:
+        ping_got_reply:
+        ; First we should save the optimal packet delay in timeout_master
         ; Multiply response time by 8 to estimate time it would take for a
-        ; connect to finish. Save response time in timeout_master.
+        ; connect to finish. 
         shl eax, 3                      
         mov [timeout_master + 4], eax   
 
-        icmp_recv_reply:
+        ; Data will be stored in recvpacket
         ; Set number of bytes we expect to receive in packet
         mov [recvpacketlen], dword (iphdrlen+icmphdrlen+56)
         push dword [icmp_socket]
         call recv_packet
         add esp, 4
 
+        ; Save return value of recv_packet
+        push eax
+        ; We're done with the socket
+        push dword [icmp_socket]
+        call sys_close
+        add esp, 4
+        ; Restore return value of recv_packet
+        pop eax
+
         ; Check return value
         test eax, eax
-        ; Consider the ping to fail if we had trouble receiving actual data
-        js ping_host_failed
-        jmp ping_host_success
-
-        ping_host_failed:
-        ; We failed, close socket and set default timeout instead
-        push dword [icmp_socket]
-        call sys_close
-        add esp, 4
-        jmp set_default_timeout
-
-        ping_host_success:
-        ; Close socket
-        push dword [icmp_socket]
-        call sys_close
-        add esp, 4
+        ; If we failed to receive the packet data, consider the ping a failure
+        js set_default_timeout
 
 ; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
 connect_scan:
