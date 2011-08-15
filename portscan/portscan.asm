@@ -20,9 +20,7 @@ section .data
         sendto_error_msg:       db 'error: sys_sendto failed', 10, 0
         recvfrom_error_msg:     db 'error: sys_recvfrom failed', 10, 0
         newline_msg:            db 10, 0
-
-        ; A "master" copy of timeout: initialize it with some default value
-        timeout_master:         dd 0, 500000                  
+        usage_string:           db 'Usage: portscan <target ip>', 10, 0
 
         val_one:                dd 1
 
@@ -57,7 +55,9 @@ section .bss
         ; }; 
         ; This can be mangled by us or the kernel at any time!
         timeout_volatile:       resd 2                  
-        timeout_zero:           resd 2                  ; Leave as zero
+        timeout_zero:           resd 2                  
+        timeout_master:         resd 2
+
 
         sendpacket:             resb 1024               ; Packet to be sent
         sendpacketlen:          resd 1                  ; Length of packet to be sent
@@ -74,49 +74,205 @@ section .text
 
 _start:
         mov ebp, esp
-        cld                             ; String operations will increment pointers by default
+        ; String operations will hereby increment pointers by default
+        cld                             
+
+check_argc:
+        ; We want to make sure program was invoked with a single argument
+        cmp [ebp], dword 2
+        jne wrong_argument_count
+        jmp parse_argv
+        
+        wrong_argument_count:
+        ; Print usage string
+        push usage_string
+        call printstr
+        add esp, 4
+        ; Set exit code to -1 and exit
+        xor ebx, ebx
+        not ebx
+        jmp exit
 
 parse_argv:
-        ; Parse command line arguments into valid octets
-        ; Usage: portscan <host ip>
-        push dword victimaddr             ; Load destination address
-        push dword [ebp + 8]            ; Load first argument argv[1]
-        call parse_octets               ; Parse destination address
-        add esp, 8                      ; Clean up stack
-        test eax, eax                   ; Check return value
-        js malformed_ip_error           ; User invoked program incorrectly
-        load_socket_address: 
-        ; IPv4 address was valid; load sockaddr->sin_addr 
-        mov esi, victimaddr           
-        mov edi, sockaddr.sin_addr
-        movsd
-        jmp check_user_id
+        ; Parse first argument and store octets into buffer
+        push dword victimaddr           
+        push dword [ebp + 8]           
+        call parse_octets             
+        add esp, 8                   
+
+        ; Check return value
+        test eax, eax      
+        js malformed_ip_error           
+        jmp load_socket_address
 
         malformed_ip_error:
         ; The IPv4 address didn't look right
-        push parse_error_msg            ; Load error message
-        call printstr                   ; Print the error message string             
-        add esp, 4                      ; Clean up stack
-        xor ebx, ebx                    ; Zero out ebx...
-        not ebx                         ; and turn on all the bits (ebx = -1)
-        jmp exit                        ; Exit with error status 
+        ; Print error message complaining about malformed ip
+        push parse_error_msg            
+        call printstr                  
+        add esp, 4                    
+        ; Set exit code to -1 and exit
+        xor ebx, ebx                    
+        not ebx                        
+        jmp exit                      
 
-check_user_id:
+load_socket_address: 
+        ; IPv4 address was valid; point socket address to it
+        ; From now on, use this struct when sending packets to host
+        mov esi, victimaddr           
+        mov edi, sockaddr.sin_addr
+        movsd
+
+get_default_timeout:
+        ; If we're root, use ICMP ping to get optimal timeout 
         call sys_getuid
         cmp eax, 0
-        jz isr00t
-        jmp not_root
+        jne set_default_timeout
+        jmp ping_host
 
-isr00t:
-        call icmp_echo                  ; Dynamically set timeout
-        ; Extract our own IP address
-        lea esi, [recvpacket + 16]
-        mov edi, myaddr
-        movsd
+        ; Otherwise, use a 500 ms timeout, which should be sufficient if not
+        ; optimal.
+        set_default_timeout:
+        mov [timeout_master + 4], dword 500000
         jmp connect_scan
 
-not_root:
-        jmp connect_scan
+ping_host:
+        ;;; Ping the host using ICMP echo, and wait for an ICMP request packet ;;;
+
+        build_icmp_packet:
+        ; Build an ICMP packet with message type 8 (Echo request). The kernel
+        ; will craft the IP header for us because IP_HDRINCL is disabled by
+        ; default, so we don't build the IP header.
+        mov edi, sendpacket            
+        ; Type: 8 (Echo request)
+        mov al, 8                     
+        stosb                           
+        ; Code: 0 (Cleared for this type)
+        xor al, al                      
+        stosb                          
+        ; Calculate ICMP checksum later
+        xor eax, eax                    
+        stosw                         
+        ; Identifier: 0, Sequence number: 0
+        stosd                           
+        ; Now we have to zero out 56 bytes of ICMP padding data
+        xor eax, eax                    
+        mov ecx, 14                    
+        rep stosd                       
+        ; Before sending/receiving packets, store the length after filling out
+        ; the packet.
+        mov [sendpacketlen], dword (icmphdrlen + 56)
+
+        calculate_icmp_checksum:
+        ; Calculate ICMP checksum which includes ICMP header and data
+        push dword ((icmphdrlen+56)/2)
+        push dword sendpacket        
+        call cksum                     
+        add esp, 8                  
+        ; Store result in packet ICMP header
+        mov [sendpacket + 2], word ax   
+
+        create_icmp_socket:
+        ; To create a raw socket, user need root permissions
+        ; IPPROTO_ICMP, SOCK_RAW|O_NONBLOCK, PF_INET
+        push dword 1                    
+        push dword (3 | 4000q)         
+        push dword 2                  
+        call sys_socket                 
+        add esp, 12                  
+
+        ; Check return value
+        test eax, eax                   
+        ; Give up immediately if we couldn't create an icmp socket
+        js set_default_timeout
+
+        store_icmp_socket:
+        ; Store the raw socket file descriptor in icmp_socket
+        mov [icmp_socket], eax             
+
+        ;;; Send the packet through the ICMP socket we just created ;;;
+
+        send_icmp_packet:
+        ; Try to ping 10 times until we get a response from the host
+        ; Use ebx because this register will not get clobbered as per cdecl
+        ; convention.
+        mov ebx, 10                             
+        send_icmp_packet_loop:
+                ; Socket is in non-blocking mode, so we send and receieve data
+                ; asynchronously. In this case, send an ICMP Echo request, and block
+                ; until socket has data ready to be read.
+                icmp_send_request:
+                push dword [icmp_socket]
+                call send_packet
+                add esp, 4
+
+                ; Check return value
+                test eax, eax
+                ; Packet sending finished immediately (!)
+                jns check_response_time        
+                ; EAGAIN - send in progress
+                cmp eax, -115                   
+                je check_response_time
+                ; EINPROGRESS - send in progress
+                cmp eax, -11                    
+                je check_response_time
+                jmp icmp_echo_try_again
+
+                check_response_time:
+                ; Timeout is an upper bound on how long to wait before select(2)
+                ; returns. Linux will adjust the timeval struct to reflect the time
+                ; remaining, this solution is is not portable, as the man page for
+                ; select(2) tells us to consider the value of the struct undefined
+                ; after select returns. 
+                push dword [icmp_socket]
+                push dword 500000
+                call time_read_response
+                add esp, 8
+
+                ; Check return value 
+                test eax, eax                      
+                ; Socket was not ready by the time select returned, or select failed
+                js icmp_echo_try_again          
+                jmp store_response_time
+
+                ; Should we try again?
+                icmp_echo_try_again:
+                dec ebx                         
+                ; Used up all 10 tries
+                jz ping_host_failed            
+                jmp send_icmp_packet_loop     
+
+        store_response_time:
+        ; Multiply response time by 8 to estimate time it would take for a
+        ; connect to finish. Save response time in timeout_master.
+        shl eax, 3                      
+        mov [timeout_master + 4], eax   
+
+        icmp_recv_reply:
+        ; Set number of bytes we expect to receive in packet
+        mov [recvpacketlen], dword (iphdrlen+icmphdrlen+56)
+        push dword [icmp_socket]
+        call recv_packet
+        add esp, 4
+
+        ; Check return value
+        test eax, eax
+        ; Consider the ping to fail if we had trouble receiving actual data
+        js ping_host_failed
+        jmp ping_host_success
+
+        ping_host_failed:
+        ; We failed, close socket and set default timeout instead
+        push dword [icmp_socket]
+        call sys_close
+        add esp, 4
+        jmp set_default_timeout
+
+        ping_host_success:
+        ; Close socket
+        push dword [icmp_socket]
+        call sys_close
+        add esp, 4
 
 ; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
 connect_scan:
@@ -931,149 +1087,6 @@ sys_setsockopt:
         pop ebx
         mov esp, ebp
         pop ebp
-        ret
-; ------------------------------------------------------------------------------
-
-; ------------------------------------------------------------------------------
-; icmp_echo
-;       Send an ICMP Echo request to target host, and recieve reply in recvpacket
-;               Expects: stack - nothing
-;                        sockaddr - pointing to target host 
-;               Returns: eax - 0 on success, -1 on error
-;                        timeout_master - 8*RRT latency (usec)
-;                        recvpacket - ICMP Echo reply packet
-icmp_echo:
-        push ebx
-        push edi
-        
-        build_icmp_packet:
-        ; Build an ICMP packet with message type 8 (Echo request). The kernel
-        ; will craft the IP header for us because IP_HDRINCL is disabled by
-        ; default, so we don't build the IP header.
-        mov edi, sendpacket             ; Point esi to start of packet
-        mov al, 8                       ; Type: 8 (Echo request)
-        stosb                           
-        xor al, al                      ; Code: 0 (Cleared for this type)
-        stosb                          
-        xor eax, eax                    ; Calculate ICMP checksum later
-        stosw                         
-        stosd                           ; Identifier: 0, Sequence number: 0
-        ; Now we have to zero out 56 bytes of ICMP padding data
-        xor eax, eax                    
-        mov ecx, 14                     ; 56 bytes = 14 words
-        rep stosd                       ; Load 56 zero bytes
-        mov [sendpacketlen], dword (icmphdrlen + 56)
-
-        calculate_icmp_checksum:
-        ; Calculate ICMP checksum which includes ICMP header and data
-        push dword ((icmphdrlen+56)/2)  ; Length of packet in words
-        push dword sendpacket           ; Load pointer to packet on stack
-        call cksum                     
-        add esp, 8                      ; Clean up stack
-        mov [sendpacket + 2], word ax   ; Inject checksum result into packet
-
-        create_icmp_socket:
-        ; To create a raw socket, user need root permissions
-        push dword 1                    ; Protocol: IPPROTO_ICMP
-        push dword (3 | 4000q)          ; Type: SOCK_RAW | O_NONBLOCK
-        push dword 2                    ; Domain: PF_INET
-        call sys_socket                 
-        add esp, 12                     ; Clean up stack
-        ; Check return value
-        test eax, eax                   
-        js create_icmp_socket_failed
-        jmp store_icmp_socket
-        
-        ; Quit immediately
-        create_icmp_socket_failed:
-        xor eax, eax
-        not eax
-        jmp icmp_echo_exit
-
-        store_icmp_socket:
-        ; Store raw socket file descriptor in icmp_socket
-        mov [icmp_socket], eax             
-
-        send_icmp_packet:
-        ; Now we should be ready to send bytes to the other host 
-        ; Initialize ping counter to 10. Try to ping this many times until we
-        ; get a response from the host (or give up)!
-        mov ebx, 10                             
-        send_icmp_packet_loop:
-                ; Socket is in non-blocking mode, so we send and receieve data
-                ; asynchronously. In this case, send an ICMP Echo request, and block
-                ; until socket has data ready to be read.
-                icmp_send_request:
-                push dword [icmp_socket]
-                call send_packet
-                add esp, 4
-
-                ; Check return value
-                test eax, eax
-                jns check_response_time         ; Send finished immediately (!)
-                cmp eax, -115                   ; EAGAIN - send in progress
-                je check_response_time
-                cmp eax, -11                    ; EINPROGRESS - send in progress
-                je check_response_time
-                jmp icmp_echo_try_again
-
-                check_response_time:
-                ; Timeout is an upper bound on how long to wait before select(2)
-                ; returns. Linux will adjust the timeval struct to reflect the time
-                ; remaining, this solution is is not portable, as the man page for
-                ; select(2) tells us to consider the value of the struct undefined
-                ; after select returns. 
-                push dword [icmp_socket]
-                push dword 500000
-                call time_read_response
-                add esp, 8
-
-                ; Check return value 
-                test eax, eax                      
-                ; Socket was not ready by the time select returned, or select failed
-                js icmp_echo_try_again          
-                ; Multiply response time by 8 to estimate time it would take for halfway connect to finish
-                shl eax, 3                      
-                mov [timeout_master + 4], eax   ; Save response time in timeout_master
-                jmp icmp_recv_reply
-                
-                ; Should we try again?
-                icmp_echo_try_again:
-                dec ebx                         ; Decrement ping "tries" counter
-                jz icmp_echo_failed             ; We used up all 10 tries
-                jmp send_icmp_packet_loop       ; Try again
-
-        icmp_recv_reply:
-        ; Set number of bytes we expect to receive in packet
-        mov [recvpacketlen], dword (iphdrlen+icmphdrlen+56)
-        push dword [icmp_socket]
-        call recv_packet
-        add esp, 4
-
-        ; Check return value
-        test eax, eax
-        js icmp_echo_failed
-
-        ; Close socket
-        push dword [icmp_socket]
-        call sys_close
-        add esp, 4
-        ; Set return value to 0
-        xor eax, eax
-        jmp icmp_echo_exit
-
-        icmp_echo_failed:
-        push dword [icmp_socket]
-        ; Close socket
-        call sys_close
-        add esp, 4
-        ; Set return value to -1
-        xor eax, eax
-        not eax
-
-icmp_echo_exit:
-        pop edi
-        pop ebx
         ret
 ; ------------------------------------------------------------------------------
 
