@@ -199,7 +199,7 @@ ping_host:
                 dec ebx
                 jnz send_ping_requests
 
-        ;;; Check how long it takes to get our first ICMP Echo response ;;;
+        ;;; Check how long it takes to get our first ICMP Echo reply ;;;
 
         ; Timeout is an upper bound on how long to wait before select(2)
         ; returns. Linux will adjust the timeval struct to reflect the time
@@ -229,6 +229,7 @@ ping_host:
         ; First we should save the optimal packet delay in timeout_master
         ; Multiply response time by 8 to estimate time it would take for a
         ; connect to finish. 
+        mov eax, [timeout_volatile + 4]
         shl eax, 3                      
         mov [timeout_master + 4], eax   
 
@@ -1125,64 +1126,57 @@ recv_packet:
 ; time_read_response
 ;       Given a socket, return the time elapsed until data is ready to be read from it
 ;               Expects: stack - timeout (usec), socket
-;               Returns: eax - response time (usec), or -1 on error or timeout exceeded
+;               Returns: timeval_volatile - response time (usec)
+;                        eax - 0 on success or -1 on error or timeout exceeded
 time_read_response:
         push ebp
         mov ebp, esp
-        ; local "timer" + "readfds"
-        sub esp, (8+32*4)
-        push esi
-        push edi
-
-        lea esi, [ebp - (8+32*4)] ; Set pointer to "readfds"
-        lea edi, [ebp - 8] ; Set pointer to "timer"
-
-        ; Zero out our temporary "readfds"
-        push esi
-        call fdzero
-        add esp, 4
 
         ; Add socket to readfds
         push dword [ebp + 12]           
-        push esi
+        push readfds
         call fdset
         add esp, 8                      
 
         ; We reserved space for a struct timeval in local storage
         ; Initialize timeval.usec to maximum timeout argument
-        mov [edi], dword 0
+        mov [timeout_volatile], dword 0
         mov eax, [ebp + 8]
-        mov [edi + 4], eax
+        mov [timeout_volatile + 4], eax
 
         ; Block until data is ready to be read, or we exceed timeout
-        push edi                        ; Load "timer"
-        push dword 0                    ; Don't wait for exceptfds
-        push dword 0                    ; Don't wait for writefds
-        push esi                        ; Block until read is ready
-        push dword [ebp + 12]           ; nfds = highest fd + 1
+        push timeout_volatile       
+        push dword 0                    
+        push dword 0                   
+        push readfds                  
+        push dword [ebp + 12]        
         inc dword [esp]
         call sys_select                 
-        add esp, 16                     ; Clean up stack, preserve "timer"
+        add esp, 16                
 
         ; Check return value
         cmp eax, 0
         jz not_ready
         js select_failed
+        jmp get_response_time
 
-        ; Calculate response time (usecs)
-        mov eax, [ebp + 8]
-        sub eax, [edi + 4]
-        jmp time_read_response_exit
-        
         ; Return -1 in eax if timeout exceeded or select failed
         select_failed:
         not_ready:
         xor eax, eax
         not eax
+        jmp time_read_response_exit
+        
+        get_response_time:
+        ; Calculate response time (usecs)
+        ; Initial max timeout - time remaining = elapsed time
+        mov eax, [ebp + 8]
+        mov ecx, [timeout_volatile + 4]
+        sub eax, ecx
+        mov [timeout_volatile + 4], eax
+        xor eax, eax
         
         time_read_response_exit:
-        pop esi
-        pop edi
         mov esp, ebp
         pop ebp
         ret
