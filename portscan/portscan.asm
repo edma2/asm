@@ -82,6 +82,8 @@ _start:
         ; String operations will hereby increment pointers by default
         cld                             
 
+        mov eax, 12
+
 check_argc:
         ; We want to make sure program was invoked with a single argument
         cmp [ebp], dword 2
@@ -282,15 +284,12 @@ connect_scan:
                 call fdzero
                 add esp, 4
                 gather_sockets:
-                        ; "Gather" sockets one by one using socket(3) and connect(3)
-                        make_socket:
-                        ; Call sys_socket with arguments
+                        ; Create socket with arguments
                         ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
                         push dword 6 
                         push dword (1 | 4000q) 
-                        push dword 2 
-                        call sys_socket
-                        add esp, 12
+                        call spawn_socket
+                        add esp, 8
 
                         ; Check return value
                         test eax, eax
@@ -303,10 +302,7 @@ connect_scan:
                         ; Save -errno on stack
                         push eax 
                         ; We should close(3) all our open sockets
-                        ; esi should contain count of open sockets
-                        push esi
-                        call kill_sockets
-                        add esp, 4
+                        call free_all_sockets
                         ; Print socket error message 
                         push socket_error_msg
                         call printstr
@@ -351,9 +347,7 @@ connect_scan:
                         ; Connect failed for reasons other than being "in progress"
                         ; Save -errno on stack
                         push eax 
-                        push esi
-                        call kill_sockets
-                        add esp, 4
+                        call free_all_sockets
                         push connect_error_msg
                         call printstr
                         add esp, 4
@@ -403,9 +397,7 @@ connect_scan:
                 ; We had some sort of trouble with select(2)
                 ; Save -errno on stack and kill all sockets
                 push eax
-                push dword max_sockets
-                call kill_sockets
-                add esp, 4
+                call free_all_sockets
                 push select_error_msg
                 call printstr
                 add esp, 4
@@ -464,9 +456,7 @@ connect_scan:
 
                 free_sockets:
                 ; Kill all the sockets we opened 
-                push dword max_sockets
-                call kill_sockets
-                add esp, 4
+                call free_all_sockets
                 ; Check if we're done
                 cmp bx, word 1024 
                 jl connect_scan_loop
@@ -803,26 +793,53 @@ spawn_socket:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; kill_sockets - close first n fd in the socket array 
-;       expects: stack - number of fd to close
-;       returns: nothing
-kill_sockets:
+; free_socket:
+;       Close a socket and remove it from masterfds
+;               Expects: socket 
+;               Returns: nothing
+free_socket:
         push ebp
         mov ebp, esp
 
-        mov esi, socket_array
-        mov ecx, [ebp + 8]
+        push dword [ebp + 8]
+        call sys_close
+        add esp, 4
+        btr [masterfds], eax
 
-        cmp ecx, 0
-        je .done
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; free_all_sockets:
+;               Close all file descriptors present in masterfds
+;       Expects: nothing
+;       Returns: nothing
+free_all_sockets:
+        push ebp
+        mov ebp, esp
+
+        ; Initialize bitmap index to 1023, which is the highest file descriptor
+        ; that can exist in a fdset.
+        mov eax, 1023
+        ; Loop through all 1024 (Todo: this is slow!) bits in fdset
         .loop:
-                lodsd                   ; Load next fd in eax
-                push eax                
+                ; Clear bit to zero and store original bit in CF
+                btr [masterfds], eax
+                ; If bit was set, close the mapped socket
+                jc .close
+                jmp .next
+
+                .close:
+                push eax
                 call sys_close
-                add esp, 4
-                dec ecx
-                jnz .loop
-        .done:
+                pop eax
+
+                .next:
+                dec eax
+                jns .loop
+
         mov esp, ebp
         pop ebp
         ret
