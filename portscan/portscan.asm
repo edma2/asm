@@ -82,8 +82,6 @@ _start:
         ; String operations will hereby increment pointers by default
         cld                             
 
-        mov eax, 12
-
 check_argc:
         ; We want to make sure program was invoked with a single argument
         cmp [ebp], dword 2
@@ -91,14 +89,10 @@ check_argc:
         jmp parse_argv
         
         wrong_argument_count:
-        ; Print usage string
-        push usage_string
-        call printstr
-        add esp, 4
         ; Set exit code to -1 and exit
-        xor ebx, ebx
-        not ebx
-        jmp exit
+        push dword -1 
+        push dword usage_string
+        call exit_prematurely
 
 parse_argv:
         ; Parse first argument and store octets into buffer
@@ -115,13 +109,9 @@ parse_argv:
         malformed_ip_error:
         ; The IPv4 address didn't look right
         ; Print error message complaining about malformed ip
-        push parse_error_msg            
-        call printstr                  
-        add esp, 4                    
-        ; Set exit code to -1 and exit
-        xor ebx, ebx                    
-        not ebx                        
-        jmp exit                      
+        push dword -1
+        push dword parse_error_msg            
+        call exit_prematurely                  
 
 load_socket_address: 
         ; IPv4 address was valid; point socket address to it
@@ -130,7 +120,7 @@ load_socket_address:
         mov edi, sockaddr.sin_addr
         movsd
 
-get_default_timeout:
+get_dynamic_timeout:
         ; If we're root, use ICMP ping to get optimal timeout 
         call sys_getuid
         cmp eax, 0
@@ -158,9 +148,16 @@ ping_host:
         ; Check return value
         test eax, eax                   
         ; Give up immediately if we couldn't create an icmp socket
-        js set_default_timeout
+        js create_icmp_socket_failed
         ; Store the raw socket file descriptor in icmp_socket
         mov [icmp_socket], eax             
+        jmp build_icmp_packet
+
+        create_icmp_socket_failed:
+        ; We had trouble creating the socket
+        push eax 
+        push socket_error_msg
+        call exit_prematurely
 
         build_icmp_packet:
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
@@ -236,8 +233,14 @@ ping_host:
                 
         ; Check return value
         cmp eax, 0
+        js ping_select_failed
         jz ping_no_reply
         jmp ping_got_reply
+
+        ping_select_failed:
+        push eax
+        push dword select_error_msg
+        call exit_prematurely
 
         ping_no_reply:
         push dword [icmp_socket]
@@ -275,14 +278,16 @@ connect_scan:
         ; cdecl: ebx/esi/edi should always be perserved by the callee
         xor ebx, ebx 
         connect_scan_loop: 
+                ; Copy masterfds to writefds 
+                mov esi, masterfds
+                mov edi, writefds
+                mov ecx, 32
+                rep movsd
+
                 ; Reset index into sockets, port_map
                 xor esi, esi 
                 ; Store nfds (= 1 + maximum fd) for sys_select
                 xor edi, edi 
-                ; Reset writefds (just in case)
-                push writefds
-                call fdzero
-                add esp, 4
                 gather_sockets:
                         ; Create socket with arguments
                         ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
@@ -299,17 +304,9 @@ connect_scan:
 
                         socket_create_error:
                         ; We had trouble creating the socket
-                        ; Save -errno on stack
                         push eax 
-                        ; We should close(3) all our open sockets
-                        call free_all_sockets
-                        ; Print socket error message 
                         push socket_error_msg
-                        call printstr
-                        add esp, 4
-                        ; Save -errno in eax before exiting
-                        pop eax 
-                        jmp exit
+                        call exit_prematurely
 
                         save_socket:
                         ; Socket seems good, save it to our array and map the port 
@@ -347,12 +344,8 @@ connect_scan:
                         ; Connect failed for reasons other than being "in progress"
                         ; Save -errno on stack
                         push eax 
-                        call free_all_sockets
                         push connect_error_msg
-                        call printstr
-                        add esp, 4
-                        pop eax
-                        jmp exit
+                        call exit_prematurely
 
                         connect_complete:
                         connect_in_progress:
@@ -397,12 +390,8 @@ connect_scan:
                 ; We had some sort of trouble with select(2)
                 ; Save -errno on stack and kill all sockets
                 push eax
-                call free_all_sockets
                 push select_error_msg
-                call printstr
-                add esp, 4
-                pop eax
-                jmp exit
+                call exit_prematurely
 
                 check_for_connected_sockets:
                 ; Check writefds for our sockets
@@ -460,13 +449,12 @@ connect_scan:
                 ; Check if we're done
                 cmp bx, word 1024 
                 jl connect_scan_loop
-                ; Return 0 in eax because we finished scanning
-                xor eax, eax
 
 exit:
         ; We expect ebx to contain exit status 
         mov ebp, esp
         mov eax, 1
+        xor ebx, ebx
         int 0x80
 
 ; ------------------------------------------------------------------------------
@@ -813,7 +801,7 @@ free_socket:
 
 ; ------------------------------------------------------------------------------
 ; free_all_sockets:
-;               Close all file descriptors present in masterfds
+;               Close all living sockets 
 ;       Expects: nothing
 ;       Returns: nothing
 free_all_sockets:
@@ -823,6 +811,15 @@ free_all_sockets:
         ; Initialize bitmap index to 1023, which is the highest file descriptor
         ; that can exist in a fdset.
         mov eax, 1023
+        lea ecx, [masterfds + 32]
+        ; Find dword containing highest numbered file descriptor
+        .find:
+        cmp [ecx], dword 0
+        jnz .loop
+        sub eax, 32
+        sub ecx, 4
+        jmp .find
+
         ; Loop through all 1024 (Todo: this is slow!) bits in fdset
         .loop:
                 ; Clear bit to zero and store original bit in CF
@@ -843,6 +840,25 @@ free_all_sockets:
         mov esp, ebp
         pop ebp
         ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; exit_prematurely
+;       Print error message, clean up sockets, then exit with exit code
+;               Expects: error msg, exit code
+;               Returns: nothing
+exit_prematurely:
+        mov ebp, esp
+        
+        push dword [ebp + 8]
+        call printstr
+        add esp, 4
+        
+        call free_all_sockets
+        mov eax, 1
+        mov ebx, [ebp + 12]
+        int 0x80
+
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
