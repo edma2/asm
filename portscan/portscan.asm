@@ -141,9 +141,8 @@ ping_host:
         ; PF_INET, SOCK_RAW|O_NONBLOCK, IPPROTO_ICMP
         push dword 1                    
         push dword (3 | 4000q)         
-        push dword 2                  
-        call sys_socket                 
-        add esp, 12                  
+        call spawn_socket                 
+        add esp, 8                  
 
         ; Check return value
         test eax, eax                   
@@ -269,7 +268,7 @@ ping_host:
 
         ; We're done with the socket
         push dword [icmp_socket]
-        call sys_close
+        call free_socket
         add esp, 4
 
 ; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
@@ -383,7 +382,7 @@ connect_scan:
 
                 cmp eax, 0
                 ; All sockets will block on write, skip to next iteration
-                je free_sockets
+                je connect_scan_cleanup
                 jns check_for_connected_sockets 
 
                 select_error:
@@ -443,7 +442,7 @@ connect_scan:
                         cmp esi, max_sockets
                         jl iterate_through_fds
 
-                free_sockets:
+                connect_scan_cleanup:
                 ; Kill all the sockets we opened 
                 call free_all_sockets
                 ; Check if we're done
