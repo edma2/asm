@@ -37,7 +37,6 @@ section .bss
 
         ; Maximum number of sockets to open at once
         max_sockets             equ 64
-
         ; Use this in tcp connect scan to map each open socket to a port
         live_sockets:           resd max_sockets        
         live_ports:             resw max_sockets        
@@ -492,9 +491,10 @@ exit:
         int 0x80
 
 ; ------------------------------------------------------------------------------
-; cksum - IP header style checksum for given length in words (16-bit) 
-;  Expects: pointer to data, data length in words 
-;  Returns: checksum 
+; cksum:  
+;       IP header style checksum for given length in words (16-bit) 
+;               Expects: pointer to data, data length in words 
+;               Returns: checksum 
 cksum:
         push ebp                ; Save frame pointer
         mov ebp, esp            ; Set new frame pointer
@@ -524,9 +524,10 @@ cksum:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; printstr - print a string to standard output
-;  Expects: string address
-;  Returns: bytes written, -errno on error
+; printstr: 
+;       Print a string to standard output
+;               Expects: string address
+;               Returns: bytes written, -errno on error
 printstr:
         push ebp                ; Save frame pointer
         mov ebp, esp            ; Set new frame pointer
@@ -547,9 +548,10 @@ printstr:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; strlen - calculate the length of null-terminated string
-;       expects: string address
-;       returns: length in eax
+; strlen: 
+;       Calculate the length of null-terminated string
+;               Expects: string address
+;               Returns: length in eax
 strlen:
         push ebp     
         mov ebp, esp
@@ -571,9 +573,10 @@ strlen:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; parse_octets - convert IPv4 address from text to binary form
-;       expects: ip string, destination buffer
-;       returns: 0 in eax, ~0 on error
+; parse_octets:
+;       Convert IPv4 address from text to binary form
+;               Expects: ip string, destination buffer
+;               Returns: 0 in eax, ~0 on error
 parse_octets:
         push ebp
         mov ebp, esp
@@ -665,9 +668,10 @@ parse_octets:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; strtoul - convert a number from text to binary form
-;       expects: string address
-;       returns: 32-bit unsigned integer in eax
+; strtoul:
+;       Convert a number from text to binary form
+;               Expects: string address
+;               Returns: 32-bit unsigned integer in eax
 strtoul:
         push ebp
         mov ebp, esp
@@ -695,9 +699,10 @@ strtoul:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; ultostr - convert an unsigned integer to a C string
-;       expects: 32-bit unsigned integer, buffer 
-;       returns: nothing
+; ultostr: 
+;       Convert an unsigned integer to a C string
+;               Expects: 32-bit unsigned integer, buffer 
+;               Returns: nothing
 ultostr:
         push ebp  
         mov ebp, esp
@@ -817,9 +822,9 @@ free_socket:
 
 ; ------------------------------------------------------------------------------
 ; free_all_sockets:
-;               Close all living sockets 
-;       Expects: nothing
-;       Returns: nothing
+;       Close all living sockets 
+;               Expects: nothing
+;               Returns: nothing
 free_all_sockets:
         push ebp
         mov ebp, esp
@@ -859,7 +864,7 @@ free_all_sockets:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; exit_prematurely
+; exit_prematurely:
 ;       Print error message, clean up sockets, then exit with exit code
 ;               Expects: error msg, exit code
 ;               Returns: nothing
@@ -879,7 +884,7 @@ exit_prematurely:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; sys_getuid
+; sys_getuid:
 ;       Return the user ID of process
 ;               Expects: nothing
 ;               Returns: uid in eax
@@ -897,9 +902,10 @@ sys_getuid:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; sys_read - read from file
-;       expects: fd, buffer, buffer len
-;       returns: number of bytes read, or -errno
+; sys_read:
+;       Read from file
+;               Expects: fd, buffer, buffer len
+;               Returns: number of bytes read, or -errno
 sys_read:
         push ebp
         mov ebp, esp
@@ -918,9 +924,10 @@ sys_read:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; sys_write - write to file
-;       expects: fd, buffer, buffer len
-;       returns: number of bytes written, or -errno
+; sys_write:
+;       Write to file
+;               Expects: fd, buffer, buffer len
+;               Returns: number of bytes written, or -errno
 sys_write:
         push ebp
         mov ebp, esp
@@ -939,9 +946,10 @@ sys_write:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; sys_close - close a file descriptor
-;       expects: file descriptor
-;       returns: 0 in eax | -errno in eax if error
+; sys_close:
+;       Close a file descriptor
+;               Expects: file descriptor
+;               Returns: 0 in eax | -errno in eax if error
 sys_close:
         push ebp
         mov ebp, esp
@@ -958,9 +966,10 @@ sys_close:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; sys_connect - connect a socket       
-;       expects: int socket, address, address length
-;       returns: 0 in eax or -errno on error
+; sys_connect:
+;       Connect a socket       
+;               Expects: int socket, address, address length
+;               Returns: 0 in eax or -errno on error
 sys_connect:
         push ebp
         mov ebp, esp
@@ -984,9 +993,10 @@ sys_connect:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; sys_socket - create a socket       
-;       expects: int domain, int type, int protocol
-;       returns: 0 in eax or -errno on error
+; sys_socket: 
+;       Create a socket       
+;               Expects: int domain, int type, int protocol
+;               Returns: 0 in eax or -errno on error
 sys_socket:
         push ebp
         mov ebp, esp
@@ -1006,10 +1016,11 @@ sys_socket:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; sys_select - wrapper around sys_select
-;       expects: int nfds, fd_set *readfds, fd_set *writefds,
-;                fd_set *exceptfds, struct timeval *timeout
-;       returns: total number of fildes set in fd_set structs, -errno if error
+; sys_select:
+;       Wrapper around sys_select
+;               Expects: int nfds, fd_set *readfds, fd_set *writefds,
+;                       fd_set *exceptfds, struct timeval *timeout
+;               Returns: total number of fildes set in fd_set structs, -errno if error
 sys_select:
         push ebp
         mov ebp, esp
