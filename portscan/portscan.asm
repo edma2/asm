@@ -41,13 +41,13 @@ section .bss
         ; Use this in tcp connect scan to map each open socket to a port
         live_sockets:           resd max_sockets        
         live_ports:             resw max_sockets        
+        ; Storage for socket we use when we ICMP ping
+        icmp_socket:            resd 1
 
         ; Addresses in network byte order
         victimaddr:             resd 1                  
         myaddr:                 resd 1                 
         
-        icmp_socket:            resd 1
-
         ; Temporary place where we store our strings
         write_buffer:           resb 12                 
 
@@ -832,6 +832,7 @@ free_all_sockets:
 ;               Expects: error msg, exit code
 ;               Returns: nothing
 exit_prematurely:
+        push ebp
         mov ebp, esp
         
         push dword [ebp + 8]
