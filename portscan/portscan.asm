@@ -5,51 +5,51 @@
 ; ==============================================================================
 
 section .data
+        ; AF_INET
         sockaddr:
-                .sin_family:    dw 2            ; AF_INET
-                .sin_port:      dw 0            ; Dynamically set before creating each socket
-                .sin_addr:      dd 0            ; Load octets here after parsing
+                .sin_family:    dw 2 
+                .sin_port:      dw 0 
+                .sin_addr:      dd 0
                 .sin_zero:      db 0,0,0,0,0,0,0,0
+        sockaddrlen_addr:       dd sockaddrlen
         sockaddrlen             equ $-sockaddr
-        sockaddrlen_addr:       dd sockaddrlen  ; recvfrom(2) expects this as an address ?!
 
-        socket_error_msg:       db 'error: sys_socket failed', 10, 0
-        select_error_msg:       db 'error: sys_select failed', 10, 0
-        parse_error_msg:        db 'error: Malformed IP address', 10, 0
-        connect_error_msg:      db 'error: Unexpected connect error', 10, 0
-        sendto_error_msg:       db 'error: sys_sendto failed', 10, 0
-        recvfrom_error_msg:     db 'error: sys_recvfrom failed', 10, 0
-        newline_msg:            db 10, 0
+        socket_error_msg:       db 'Error: sys_socket failed', 10, 0
+        select_error_msg:       db 'Error: sys_select failed', 10, 0
+        parse_error_msg:        db 'Error: malformed ip address', 10, 0
+        connect_error_msg:      db 'Error: unexpected connect error', 10, 0
+        sendto_error_msg:       db 'Error: sys_sendto failed', 10, 0
+        recvfrom_error_msg:     db 'Error: sys_recvfrom failed', 10, 0
         usage_string:           db 'Usage: portscan <target ip>', 10, 0
-
-        val_one:                dd 1
+        newline_msg:            db 10, 0
 
 ; ==============================================================================
 
 section .bss
-        ; #define __NFDBITS (8 * sizeof(unsigned long))  // bits per file descriptor
-        ; #define __FD_SETSIZE 1024                      // bits per fd_set
-        ; #define __FDSET_LONGS (__FD_SETSIZE/__NFDBITS) // ints per fd_set
-        ;
+        ; Socket Bitmap Interface - used to create, close, and select(2) sockets 
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
+        masterfds:              resd 32
         writefds:               resd 32                
         readfds:                resd 32                 
-        ; Used to manage open sockets
-        masterfds:              resd 32
         masterfdslen            equ 32                       
 
+        ; Maximum number of sockets to open at once
         max_sockets             equ 64
-        socket_array:           resd max_sockets        
-        port_map:               resw max_sockets        ; Each socket is mapped to a port
+
+        ; Use this in tcp connect scan to map each open socket to a port
+        live_sockets:           resd max_sockets        
+        live_ports:             resw max_sockets        
+
+        ; Addresses in network byte order
+        victimaddr:             resd 1                  
+        myaddr:                 resd 1                 
         
         icmp_socket:            resd 1
 
-        victimaddr:             resd 1                  ; Address of host in binary format octets
-        myaddr:                 resd 1                  ; Address of localhost in binary format octets
-
-        write_buffer:           resb 12                 ; Temporary place where we store our strings
+        ; Temporary place where we store our strings
+        write_buffer:           resb 12                 
 
         ; struct timeval {
         ;     int tv_sec;     // seconds
@@ -57,20 +57,23 @@ section .bss
         ; }; 
         ; This can be mangled by us or the kernel at any time!
         timeout_volatile:       resd 2                  
+        ; This is always zero
         timeout_zero:           resd 2                  
+        ; This is the default delay we use between sending packets
         timeout_master:         resd 2
-
-
-        sendpacket:             resb 1024               ; Packet to be sent
-        sendpacketlen:          resd 1                  ; Length of packet to be sent
-        recvpacket:             resb 1024               ; Data received
-        recvpacketlen:          resd 1                  ; Length of packet to be received
-
-        iphdrlen                equ 20                  ; Length of IP header
-        icmphdrlen              equ 8                   ; Length of ICMP header
-
         ; Maximum time to wait for incoming packets in usec
         max_timeout             equ 500000      
+
+        ; Packet Delivery Interface
+        ; Fill out these buffers and lengths before sending or receiving packets
+        sendpacket:             resb 1024               
+        sendpacketlen:          resd 1                 
+        recvpacket:             resb 1024             
+        recvpacketlen:          resd 1               
+
+        ; Some useful constants that tell us header sizes
+        iphdrlen                equ 20                  
+        icmphdrlen              equ 8                  
 
 ; ==============================================================================
 
@@ -130,7 +133,7 @@ get_dynamic_timeout:
         ; Otherwise, use a 500 ms timeout, which should be sufficient if not
         ; optimal.
         set_default_timeout:
-        mov [timeout_master + 4], dword 500000
+        mov [timeout_master + 4], dword max_timeout
         jmp connect_scan
 
 ping_host:
@@ -283,7 +286,7 @@ connect_scan:
                 mov ecx, masterfdslen
                 rep movsd
 
-                ; Reset index into sockets, port_map
+                ; Reset index into sockets, live_ports
                 xor esi, esi 
                 ; Store nfds (= 1 + maximum fd) for sys_select
                 xor edi, edi 
@@ -309,8 +312,8 @@ connect_scan:
 
                         save_socket:
                         ; Socket seems good, save it to our array and map the port 
-                        mov [socket_array + 4 * esi], eax 
-                        mov [port_map + 2 * esi], word bx 
+                        mov [live_sockets + 4 * esi], eax 
+                        mov [live_ports + 2 * esi], word bx 
                         inc esi
                         ; Update nfds: max(nfds, fd)
                         cmp eax, edi
@@ -399,7 +402,7 @@ connect_scan:
                 iterate_through_fds:
                         check_if_write_blocks:
                         ; Fetch file descriptor
-                        mov eax, [socket_array + 4 * esi]
+                        mov eax, [live_sockets + 4 * esi]
                         bt [writefds], eax
 
                         ; This port didn't respond to our TCP request:
@@ -422,7 +425,7 @@ connect_scan:
                         print_port:
                         ; We found an open port!
                         ; Convert the port number to a printable string
-                        movzx edx, word [port_map + 2 * esi]
+                        movzx edx, word [live_ports + 2 * esi]
                         push write_buffer
                         push edx
                         call ultostr 
