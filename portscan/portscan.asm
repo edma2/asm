@@ -67,6 +67,9 @@ section .bss
         iphdrlen                equ 20                  ; Length of IP header
         icmphdrlen              equ 8                   ; Length of ICMP header
 
+        ; Maximum time to wait for incoming packets in usec
+        max_timeout             equ 500000      
+
 ; ==============================================================================
 
 section .text
@@ -205,31 +208,50 @@ ping_host:
         ; returns. Linux will adjust the timeval struct to reflect the time
         ; remaining. Furthermore, we only care about the first reply we get,
         ; and ignore the rest.
-        push dword [icmp_socket]
-        push dword 500000
-        call time_read_response
-        add esp, 8
 
-        ; Return value should contain time elapsed or -1 if select error'd out
-        ; or no sockets were ready to be read from.
-        test eax, eax                      
-        js ping_no_reply          
+        ; Add socket to readfds
+        push dword [icmp_socket]           
+        push readfds
+        call fdset
+        add esp, 8                      
+
+        ; Initialize tv_usec to maximum timeout 
+        mov edi, timeout_volatile
+        xor eax, eax
+        stosd
+        mov eax, max_timeout
+        stosd
+
+        ; Block until data is ready to be read, or we exceed timeout
+        push timeout_volatile       
+        push dword 0                    
+        push dword 0                   
+        push readfds                  
+        push dword [icmp_socket]
+        inc dword [esp]
+        call sys_select                 
+        add esp, 20
+                
+        ; Check return value
+        cmp eax, 0
+        jz ping_no_reply
         jmp ping_got_reply
-        
+
         ping_no_reply:
-        ; Ping failed, close socket and set default timeout instead
         push dword [icmp_socket]
         call sys_close
         add esp, 4
         jmp set_default_timeout
-
+        
         ;;; Receieve data and calculate packet delay ;;;
 
         ping_got_reply:
         ; First we should save the optimal packet delay in timeout_master
-        ; Multiply response time by 8 to estimate time it would take for a
-        ; connect to finish. 
-        mov eax, [timeout_volatile + 4]
+        mov eax, max_timeout
+        mov ecx, [timeout_volatile + 4]
+        sub eax, ecx
+        ; Multiply response time by 8 to estimate time it would take to
+        ; establish a tcp connection 
         shl eax, 3                      
         mov [timeout_master + 4], eax   
 
@@ -239,19 +261,11 @@ ping_host:
         push dword [icmp_socket]
         call recv_packet
         add esp, 4
-        ; Save return value of recv_packet
-        push eax
+
         ; We're done with the socket
         push dword [icmp_socket]
         call sys_close
         add esp, 4
-        ; Restore return value of recv_packet
-        pop eax
-
-        ; Check return value
-        test eax, eax
-        ; If we failed to receive the packet data, consider the ping a failure
-        js set_default_timeout
 
 ; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
 connect_scan:
@@ -1119,67 +1133,6 @@ recv_packet:
         mov esp, ebp
         pop ebp
         ret
-; ------------------------------------------------------------------------------
-
-; ------------------------------------------------------------------------------
-; time_read_response
-;       Given a socket, return the time elapsed until data is ready to be read from it
-;               Expects: stack - timeout (usec), socket
-;               Returns: timeval_volatile - response time (usec)
-;                        eax - 0 on success or -1 on error or timeout exceeded
-time_read_response:
-        push ebp
-        mov ebp, esp
-
-        ; Add socket to readfds
-        push dword [ebp + 12]           
-        push readfds
-        call fdset
-        add esp, 8                      
-
-        ; We reserved space for a struct timeval in local storage
-        ; Initialize timeval.usec to maximum timeout argument
-        mov [timeout_volatile], dword 0
-        mov eax, [ebp + 8]
-        mov [timeout_volatile + 4], eax
-
-        ; Block until data is ready to be read, or we exceed timeout
-        push timeout_volatile       
-        push dword 0                    
-        push dword 0                   
-        push readfds                  
-        push dword [ebp + 12]        
-        inc dword [esp]
-        call sys_select                 
-        add esp, 16                
-
-        ; Check return value
-        cmp eax, 0
-        jz not_ready
-        js select_failed
-        jmp get_response_time
-
-        ; Return -1 in eax if timeout exceeded or select failed
-        select_failed:
-        not_ready:
-        xor eax, eax
-        not eax
-        jmp time_read_response_exit
-        
-        get_response_time:
-        ; Calculate response time (usecs)
-        ; Initial max timeout - time remaining = elapsed time
-        mov eax, [ebp + 8]
-        mov ecx, [timeout_volatile + 4]
-        sub eax, ecx
-        mov [timeout_volatile + 4], eax
-        xor eax, eax
-        
-        time_read_response_exit:
-        mov esp, ebp
-        pop ebp
-        ret
-
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
