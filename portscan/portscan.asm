@@ -74,6 +74,9 @@ section .bss
         ; Some useful constants that tell us header sizes
         iphdrlen                equ 20                  
         icmphdrlen              equ 8                  
+        ; Errnos we expect to see when using non-blocking sockets
+        EINPROGRESS             equ -115
+        EAGAIN                  equ -11
 
 ; ==============================================================================
 
@@ -156,7 +159,7 @@ ping_host:
         jmp build_icmp_packet
 
         create_icmp_socket_failed:
-        ; We had trouble creating the socket
+        ; We had trouble creating the socket, print error message and exit
         push eax 
         push socket_error_msg
         call exit_prematurely
@@ -202,9 +205,9 @@ ping_host:
                 push dword [icmp_socket]
                 call send_packet
                 add esp, 4
-                cmp eax, -115   
+                cmp eax, EINPROGRESS   
                 je .next
-                cmp eax, -11
+                cmp eax, EAGAIN
                 je .next
                 test eax, eax
                 js ping_send_failed
@@ -363,9 +366,9 @@ connect_scan:
 
                         check_errno:
                         ; We expect to see EAGAIN or EINPROGRESS
-                        cmp eax, -115
+                        cmp eax, EINPROGRESS
                         je connect_in_progress
-                        cmp eax, -11
+                        cmp eax, EAGAIN
                         je connect_in_progress
                         cmp eax, 0
                         ; This would be very unexpected!
