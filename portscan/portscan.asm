@@ -37,9 +37,11 @@ section .bss
         ; These are accessed globally and as function parameters
         writefds:               resd 32                 ; Used as select(2) argument
         readfds:                resd 32                 ; Used as select(2) argument
+        ; Used to manage open sockets
+        masterfds:              resd 32
 
         max_sockets             equ 64
-        socket_array:           resd max_sockets        ; Where we save all open sockets 
+        socket_array:           resd max_sockets        
         port_map:               resw max_sockets        ; Each socket is mapped to a port
         
         icmp_socket:            resd 1
@@ -144,7 +146,7 @@ ping_host:
 
         create_icmp_socket:
         ; To create a raw socket, user need root permissions
-        ; IPPROTO_ICMP, SOCK_RAW|O_NONBLOCK, PF_INET
+        ; PF_INET, SOCK_RAW|O_NONBLOCK, IPPROTO_ICMP
         push dword 1                    
         push dword (3 | 4000q)         
         push dword 2                  
@@ -210,10 +212,8 @@ ping_host:
         ; and ignore the rest.
 
         ; Add socket to readfds
-        push dword [icmp_socket]           
-        push readfds
-        call fdset
-        add esp, 8                      
+        mov eax, [icmp_socket]
+        bts [readfds], eax
 
         ; Initialize tv_usec to maximum timeout 
         mov edi, timeout_volatile
@@ -250,9 +250,9 @@ ping_host:
         mov eax, max_timeout
         mov ecx, [timeout_volatile + 4]
         sub eax, ecx
-        ; Multiply response time by 8 to estimate time it would take to
+        ; Multiply response time by 4 to estimate time it would take to
         ; establish a tcp connection 
-        shl eax, 3                      
+        shl eax, 2
         mov [timeout_master + 4], eax   
 
         ; Data will be stored in recvpacket
@@ -283,7 +283,7 @@ connect_scan:
                 add esp, 4
                 gather_sockets:
                         ; "Gather" sockets one by one using socket(3) and connect(3)
-                        spawn_socket:
+                        make_socket:
                         ; Call sys_socket with arguments
                         ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
                         push dword 6 
@@ -324,11 +324,7 @@ connect_scan:
                         cmp eax, edi
                         cmovg edi, eax
                         ; Add socket to writefds
-                        push eax
-                        push writefds
-                        call fdset
-                        add esp, 4
-                        pop eax 
+                        bts [writefds], eax
 
                         attempt_connect:
                         ; Initiate TCP handshake to port
@@ -424,15 +420,11 @@ connect_scan:
                         check_if_write_blocks:
                         ; Fetch file descriptor
                         mov eax, [socket_array + 4 * esi]
-                        push eax
-                        push writefds
-                        call fdisset
-                        add esp, 4
-                        cmp eax, 0
-                        pop eax
+                        bt [writefds], eax
+
                         ; This port didn't respond to our TCP request:
                         ; this means it was probably filtered
-                        je port_was_filtered 
+                        jnc port_was_filtered 
 
                         send_empty_packet:
                         ; Seems like the socket can be written to
@@ -762,66 +754,6 @@ ultostr:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; fdset 
-;       Add fd to fdset
-;               Expects: &fdset, fd
-;               Returns: nothing
-fdset:
-        push ebp
-        mov ebp, esp
-
-        mov edx, [ebp + 8]
-        mov eax, [ebp + 12]
-        ; Save an additional copy of fd
-        mov ecx, eax
-
-        ; Divide fd by the number of bits in a 32-bit long, this gives us our
-        ; index into the fds_bits array. 
-        shr eax, 5
-        ; Note: index is a dword aligned offset 
-        lea edx, [edx + eax * 4]
-        ; Figure out the appropriate bit to set in the dword-sized array
-        ; element by looking at the last 5 bits of file descriptor
-        and ecx, 0x1f
-        ; fd_bits[fd/32] |= (1<<rem)
-        xor eax, eax
-        inc eax
-        shl eax, cl
-        or [edx], eax  
-
-        mov esp, ebp
-        pop ebp
-        ret
-; ------------------------------------------------------------------------------
-
-; ------------------------------------------------------------------------------
-; fdisset - check if a file descriptor is present in fd_set
-;       expects: pointer to struct fd_set, fd
-;       returns: 1 in eax, 0 otherwise
-fdisset:
-        push ebp
-        mov ebp, esp
-
-        mov edx, [ebp + 8]
-        mov eax, [ebp + 12]
-        mov ecx, eax
-
-        shr eax, 5
-        lea edx, [edx + eax * 4]
-        and ecx, 0x1f
-        ; fd_bits[fd/32] & (1<<rem)
-        xor eax, eax
-        inc eax
-        shl eax, cl
-        and eax, [edx]
-        shr eax, cl ; so we return 1 on success
-
-        mov esp, ebp
-        pop ebp
-        ret
-; ------------------------------------------------------------------------------
-
-; ------------------------------------------------------------------------------
 ; fdzero - zero out an fd_set
 ;       expects: pointer to struct fd_set
 ;       returns: nothing
@@ -834,6 +766,37 @@ fdzero:
         mov edi, [ebp + 8]
         rep stosd
 
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; spawn_socket:
+;       Create a new socket and add it to masterfds
+;               Expects: socket type, protocol
+;               Returns: eax - socket fd, -errno if error
+spawn_socket:
+        push ebp
+        mov ebp, esp
+
+        ; push protocol
+        push dword [ebp + 12]
+        ; push type
+        push dword [ebp + 8]
+        ; PF_INET by default
+        push dword 2
+        call sys_socket
+        add esp, 12
+
+        ; Check return value
+        test eax, eax
+        js .done
+        
+        ; Add it to "master" fd bitfield
+        bts [masterfds], eax
+
+        .done:
         mov esp, ebp
         pop ebp
         ret
