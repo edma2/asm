@@ -34,11 +34,11 @@ section .bss
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
-        ; These are accessed globally and as function parameters
-        writefds:               resd 32                 ; Used as select(2) argument
-        readfds:                resd 32                 ; Used as select(2) argument
+        writefds:               resd 32                
+        readfds:                resd 32                 
         ; Used to manage open sockets
         masterfds:              resd 32
+        masterfdslen            equ 32                       
 
         max_sockets             equ 64
         socket_array:           resd max_sockets        
@@ -281,7 +281,7 @@ connect_scan:
                 ; Copy masterfds to writefds 
                 mov esi, masterfds
                 mov edi, writefds
-                mov ecx, 32
+                mov ecx, masterfdslen
                 rep movsd
 
                 ; Reset index into sockets, port_map
@@ -732,24 +732,6 @@ ultostr:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; fdzero - zero out an fd_set
-;       expects: pointer to struct fd_set
-;       returns: nothing
-fdzero:
-        push ebp
-        mov ebp, esp
-
-        xor eax, eax
-        mov ecx, 32
-        mov edi, [ebp + 8]
-        rep stosd
-
-        mov esp, ebp
-        pop ebp
-        ret
-; ------------------------------------------------------------------------------
-
-; ------------------------------------------------------------------------------
 ; spawn_socket:
 ;       Create a new socket and add it to masterfds
 ;               Expects: socket type, protocol
@@ -811,7 +793,7 @@ free_all_sockets:
         ; Initialize bitmap index to 1023, which is the highest file descriptor
         ; that can exist in a fdset.
         mov eax, 1023
-        lea ecx, [masterfds + 32]
+        lea ecx, [masterfds + masterfdslen]
         ; Find dword containing highest numbered file descriptor
         .find:
         cmp [ecx], dword 0
