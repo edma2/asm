@@ -484,7 +484,6 @@ connect_scan:
                 jl connect_scan_loop
 
 exit:
-        ; We expect ebx to contain exit status 
         mov ebp, esp
         mov eax, 1
         xor ebx, ebx
