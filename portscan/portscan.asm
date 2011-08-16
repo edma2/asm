@@ -202,9 +202,24 @@ ping_host:
                 push dword [icmp_socket]
                 call send_packet
                 add esp, 4
+                cmp eax, -115   
+                je .next
+                cmp eax, -11
+                je .next
+                test eax, eax
+                js ping_send_failed
+                .next:
                 dec ebx
                 jnz send_ping_requests
+                jmp calculate_delay
 
+        ping_send_failed:
+        ; We had trouble sending data to host, print error message and exit
+        push eax
+        push sendto_error_msg
+        call exit_prematurely
+
+        calculate_delay:
         ;;; Check how long it takes to get our first ICMP Echo reply ;;;
 
         ; Timeout is an upper bound on how long to wait before select(2)
@@ -237,14 +252,16 @@ ping_host:
         cmp eax, 0
         js ping_select_failed
         jz ping_no_reply
-        jmp ping_got_reply
+        jmp ping_get_reply
 
         ping_select_failed:
+        ; Something went wrong with select(2), print error message and exit
         push eax
         push dword select_error_msg
         call exit_prematurely
 
         ping_no_reply:
+        ; We didn't get a reply from victim, use default timeout instead
         push dword [icmp_socket]
         call sys_close
         add esp, 4
@@ -252,7 +269,7 @@ ping_host:
         
         ;;; Receieve data and calculate packet delay ;;;
 
-        ping_got_reply:
+        ping_get_reply:
         ; First we should save the optimal packet delay in timeout_master
         mov eax, max_timeout
         mov ecx, [timeout_volatile + 4]
@@ -268,7 +285,19 @@ ping_host:
         push dword [icmp_socket]
         call recv_packet
         add esp, 4
+        
+        ; Check return value
+        test eax, eax
+        js ping_recv_failed
+        jmp ping_cleanup
+                
+        ping_recv_failed:
+        ; recvfrom(2) failed, print error message and exit
+        push eax
+        push dword recvfrom_error_msg
+        call exit_prematurely
 
+        ping_cleanup:
         ; We're done with the socket
         push dword [icmp_socket]
         call free_socket
