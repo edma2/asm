@@ -311,12 +311,6 @@ connect_scan:
         ; cdecl: ebx/esi/edi should always be perserved by the callee
         xor ebx, ebx 
         connect_scan_loop: 
-                ; Copy masterfds to writefds 
-                mov esi, masterfds
-                mov edi, writefds
-                mov ecx, masterfdslen
-                rep movsd
-
                 ; Reset index into sockets, live_ports
                 xor esi, esi 
                 ; Store nfds (= 1 + maximum fd) for sys_select
@@ -400,6 +394,12 @@ connect_scan:
                 push dword 0
                 call sys_select
                 add esp, 20
+
+                ; Copy masterfds to writefds 
+                mov esi, masterfds
+                mov edi, writefds
+                mov ecx, masterfdslen
+                rep movsd
 
                 call_select: 
                 ; Wake up and smell the ashes...
