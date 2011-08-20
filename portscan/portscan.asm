@@ -5,6 +5,7 @@
 ; ==============================================================================
 
 section .data
+        open_error_msg:         db 'Error: sys_open failed', 10, 0
         socket_error_msg:       db 'Error: sys_socket failed', 10, 0
         select_error_msg:       db 'Error: sys_select failed', 10, 0
         parse_error_msg:        db 'Error: malformed ip address', 10, 0
@@ -15,6 +16,8 @@ section .data
         newline_msg:            db 10, 0
 
         sockaddrlen_addr:       dd sockaddrlen
+        magic_number:           dw 31337
+        devrpath:               db '/dev/random', 0
 
 ; ==============================================================================
 
@@ -77,6 +80,10 @@ section .bss
         recvpacket:             resb 1024             
         recvpacketlen:          resd 1               
 
+        ; For storing the file descriptor mapped to /dev/random
+        ; Close manually before exiting program with sys_close
+        devrfd:                 resd 1
+
         ; Some useful constants that tell us header sizes
         iphdrlen                equ 20                  
         icmphdrlen              equ 8                  
@@ -104,7 +111,7 @@ check_argc:
         ; Set exit code to -1 and exit
         push dword -1 
         push dword usage_string
-        call exit_prematurely
+        call premature_exit
 
 parse_argv:
         ; Parse first argument and store octets into buffer
@@ -116,16 +123,16 @@ parse_argv:
         ; Check return value
         test eax, eax      
         js malformed_ip_error           
-        jmp load_socket_address
+        jmp load_sockaddr
 
         malformed_ip_error:
         ; The IPv4 address didn't look right
         ; Print error message complaining about malformed ip
         push dword -1
         push dword parse_error_msg            
-        call exit_prematurely                  
+        call premature_exit                  
 
-load_socket_address: 
+load_sockaddr: 
         mov edi, sockaddr
         ; Set the protocol family to AF_INET
         mov ax, 2
@@ -152,7 +159,7 @@ get_dynamic_timeout:
         jmp connect_scan
 
 ping_host:
-        ;;; Ping the host using ICMP echo, and wait for an ICMP request packet ;;;
+        ;;; Send an ICMP echo packet, and wait for an ICMP request packet ;;;
 
         create_icmp_socket:
         ; To create a raw socket, user need root permissions
@@ -174,7 +181,7 @@ ping_host:
         ; We had trouble creating the socket, print error message and exit
         push eax 
         push socket_error_msg
-        call exit_prematurely
+        call premature_exit
 
         build_icmp_packet:
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
@@ -232,7 +239,7 @@ ping_host:
         ; We had trouble sending data to host, print error message and exit
         push eax
         push sendto_error_msg
-        call exit_prematurely
+        call premature_exit
 
         calculate_delay:
         ;;; Check how long it takes to get our first ICMP Echo reply ;;;
@@ -274,7 +281,7 @@ ping_host:
         ; Something went wrong with select(2), print error message and exit
         push eax
         push dword select_error_msg
-        call exit_prematurely
+        call premature_exit
 
         ping_no_reply:
         ; We didn't get a reply from victim, use default timeout instead
@@ -310,13 +317,14 @@ ping_host:
         ; recvfrom(2) failed, print error message and exit
         push eax
         push dword recvfrom_error_msg
-        call exit_prematurely
+        call premature_exit
 
         ping_cleanup:
         ; We're done with the socket
         push dword [icmp_socket]
         call free_socket
         add esp, 4
+        jmp syn_scan
 
 ; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
 connect_scan:
@@ -346,7 +354,7 @@ connect_scan:
                         ; We had trouble creating the socket
                         push eax 
                         push socket_error_msg
-                        call exit_prematurely
+                        call premature_exit
 
                         save_socket:
                         ; Socket seems good, save it to our array and map the port 
@@ -383,7 +391,7 @@ connect_scan:
                         ; Save -errno on stack
                         push eax 
                         push connect_error_msg
-                        call exit_prematurely
+                        call premature_exit
 
                         connect_complete:
                         connect_in_progress:
@@ -434,7 +442,7 @@ connect_scan:
                 ; Save -errno on stack and kill all sockets
                 push eax
                 push select_error_msg
-                call exit_prematurely
+                call premature_exit
 
                 check_for_connected_sockets:
                 ; Check writefds for our sockets
@@ -495,9 +503,76 @@ connect_scan:
                 jmp exit
 
 syn_scan:
+        ;;; Swipe the IP address from the ICMP packet we recieved ;;;
+
+        ; This should get the destination address field of the IP header
+        mov eax, [recvpacket + 16]
+        mov [myaddr], eax
+
+        ;;; Set up psuedo-random number generator ;;;
+        setup_random_number_generator:
+        ; O_RDONLY
+        push dword 0
+        ; "/dev/random"
+        push dword devrpath
+        call sys_open
+        add esp, 8
+        
+        ; Check return value 
+        test eax, eax
+        js open_devr_failed
+        ; Save the returned file descriptor
+        mov [devrfd], eax
+        jmp build_tcp_packet
+        
+        ; We were unable to open /dev/random
+        open_devr_failed:
+        ; Convert -errno to errno
+        not eax
+        inc eax
+        push dword eax
+        push dword open_error_msg
+        call premature_exit
+
+        ;;; Prepare the TCP header ;;;
+
+        build_tcp_packet:
         ; Prepare the raw TCP packet to send
         mov edi, sendpacket
+        ; Load the source port
+        mov eax, magic_number
+        xchg al, ah
+        stosw
+        ; Load the destination port (80)
+        mov ax, 80
+        xchg al, ah
+        stosw
+        ; SEQ = rand()
+        call rand
+        stosd
+        ; ACK = 0
+        xor eax, eax
+        stosd
+        ; Data offset = 5 (<< 4)
+        mov al, 0x5
+        shl al, 4
+        stosb
+        ; Flags SYN = 1
+        xor al, al
+        or al, 0x2
+        stosb
+        ; Max window size = 0xffff
+        xor ax, ax
+        not ax
+        stosw
+        ; Checksum = 0
+        xor ax, ax
+        stosw
+        ; Urgent pointer = 0 (not used)
+        stosw
 
+        ;;; Caculate TCP header checksum ;;;
+        
 exit:
         mov ebp, esp
         mov eax, 1
@@ -855,18 +930,28 @@ free_all_sockets:
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
-; exit_prematurely:
+; premature_exit:
 ;       Print error message, clean up sockets, then exit with exit code
 ;               Expects: error msg, exit code
 ;               Returns: nothing
-exit_prematurely:
+premature_exit:
         push ebp
         mov ebp, esp
         
+        ; Print error message
         push dword [ebp + 8]
         call printstr
         add esp, 4
         
+        ; Close file descriptor mapped to /dev/random if open
+        cmp [devrfd], dword 0
+        je clean_up_sockets
+        push dword [devrfd]
+        call sys_close
+        add esp, 4
+        
+        ; Free all open sockets (raw, icmp, tcp, etc...)
+        clean_up_sockets:
         call free_all_sockets
         mov eax, 1
         mov ebx, [ebp + 12]
@@ -905,7 +990,7 @@ sys_read:
         mov eax, 3
         mov ebx, [ebp + 8]
         mov ecx, [ebp + 12]
-        mov edx, [ebp + 14]
+        mov edx, [ebp + 16]
         int 0x80
 
         pop ebx
@@ -948,6 +1033,28 @@ sys_close:
         
         mov eax, 6
         mov ebx, [ebp + 8]
+        int 0x80
+        
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; sys_open:
+;       Open a file descriptor
+;               Expects: file descriptor
+;               Returns: fd in eax, or -errno if error
+sys_open:
+        push ebp
+        mov ebp, esp
+        push ebx
+        
+        ; int open(const char *pathname, int flags);
+        mov eax, 5
+        mov ebx, [ebp + 8]
+        mov ecx, [ebp + 12]
         int 0x80
         
         pop ebx
@@ -1145,6 +1252,34 @@ recv_packet:
         call sys_recvfrom               ; Send data asynchronously
         add esp, 24            
 
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; rand
+;       Get a random 32-bit integer from /dev/random
+;               Expects: stack - nothing 
+;                        devrfd - fd with read perms mapped to /dev/random 
+;               Returns: random int in eax
+rand:
+        push ebp
+        mov ebp, esp
+        sub esp, 4
+        push esi
+
+        lea esi, [ebp - 4]
+
+        push dword 4
+        push esi
+        push dword [devrfd]
+        call sys_read
+        add esp, 12
+
+        lodsd
+
+        pop esi
         mov esp, ebp
         pop ebp
         ret
