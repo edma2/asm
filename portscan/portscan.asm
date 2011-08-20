@@ -81,7 +81,6 @@ section .bss
         recvpacketlen:          resd 1               
 
         ; For storing the file descriptor mapped to /dev/random
-        ; Close manually before exiting program with sys_close
         devrfd:                 resd 1
 
         ; Some useful constants that tell us header sizes
