@@ -5,15 +5,6 @@
 ; ==============================================================================
 
 section .data
-        ; AF_INET
-        sockaddr:
-                .sin_family:    dw 2 
-                .sin_port:      dw 0 
-                .sin_addr:      dd 0
-                .sin_zero:      db 0,0,0,0,0,0,0,0
-        sockaddrlen_addr:       dd sockaddrlen
-        sockaddrlen             equ $-sockaddr
-
         socket_error_msg:       db 'Error: sys_socket failed', 10, 0
         select_error_msg:       db 'Error: sys_select failed', 10, 0
         parse_error_msg:        db 'Error: malformed ip address', 10, 0
@@ -23,10 +14,26 @@ section .data
         usage_string:           db 'Usage: portscan <target ip>', 10, 0
         newline_msg:            db 10, 0
 
+        sockaddrlen_addr:       dd sockaddrlen
+
 ; ==============================================================================
 
 section .bss
-        ; Socket Bitmap Interface - used to create, close, and select(2) sockets 
+        ; The socket address structure that needs to be filled in before making
+        ; socket calls.
+        ; struct sockaddr_in {
+        ;       short int          sin_family;  // Address family, AF_INET
+        ;       unsigned short int sin_port;    // Port number
+        ;       struct in_addr     sin_addr;    // Internet address
+        ;       unsigned char      sin_zero[8]; // Same size as struct sockaddr
+        ; };
+        sockaddr:               resb (2+2+4+8)
+        sockaddrlen             equ $-sockaddr
+
+        ; Socket Bitmap Interface: bitmaps that are usually passed to the
+        ; select() system call to monitor open sockets. They also provide our
+        ; interface for opening and closing sockets, exposed through
+        ; spawn_socket(), free_socket(), and free_all_sockets().
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
@@ -119,11 +126,17 @@ parse_argv:
         call exit_prematurely                  
 
 load_socket_address: 
+        mov edi, sockaddr
+        ; Set the protocol family to AF_INET
+        mov ax, 2
+        stosw
+        ; Zero out the port for now
+        xor ax, ax
+        stosw
         ; IPv4 address was valid; point socket address to it
         ; From now on, use this struct when sending packets to host
-        mov esi, victimaddr           
-        mov edi, sockaddr.sin_addr
-        movsd
+        mov eax, [victimaddr]
+        stosd
 
 get_dynamic_timeout:
         ; If we're root, use ICMP ping to get optimal timeout 
@@ -265,19 +278,18 @@ ping_host:
         ping_no_reply:
         ; We didn't get a reply from victim, use default timeout instead
         push dword [icmp_socket]
-        call sys_close
+        call free_socket
         add esp, 4
         jmp set_default_timeout
         
         ;;; Receieve data and calculate packet delay ;;;
 
         ping_get_reply:
-        ; First we should save the optimal packet delay in timeout_master
+        ; First we should calculate the packet delay in timeout_volatile
         mov eax, max_timeout
         mov ecx, [timeout_volatile + 4]
         sub eax, ecx
-        ; Multiply response time by 4 to estimate time it would take to
-        ; establish a tcp connection 
+        ; Extrapolate TCP connect time
         shl eax, 2
         mov [timeout_master + 4], eax   
 
@@ -349,8 +361,8 @@ connect_scan:
                         attempt_connect:
                         ; Initiate TCP handshake to port
                         ; Load port to sockaddr struct in htons() order
-                        mov [sockaddr.sin_port], byte bh 
-                        mov [sockaddr.sin_port + 1], byte bl 
+                        mov [sockaddr + 2], byte bh 
+                        mov [sockaddr + 3], byte bl 
                         push sockaddrlen
                         push sockaddr        
                         push eax 
@@ -488,6 +500,7 @@ connect_scan:
 
 syn_scan:
         ; Prepare the raw TCP packet to send
+        mov edi, sendpacket
 
 exit:
         mov ebp, esp
