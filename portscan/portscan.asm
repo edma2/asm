@@ -710,65 +710,42 @@ strtoul:
 ultostr:
         push ebp  
         mov ebp, esp
-        push esi
+        push ebx
         push edi
-        
+        push esi
+
+        ; Push string characters onto stack in reverse order
+        dec esp
+        mov [esp], byte 0
+        ; ecx counts how many characters to write
+        xor ecx, ecx
+        inc ecx
         mov eax, [ebp + 8]
-        mov edi, [ebp + 12]
-        ; Save original buffer for reference 
-        mov esi, edi
-        mov ecx, 10
-
-        ; Fairly self-explanatory, right?
-        count_digits:
-        cmp eax, 9
-        jle terminate_string
-        inc edi
-        cmp eax, 99
-        jle terminate_string
-        inc edi
-        cmp eax, 999
-        jle terminate_string
-        inc edi
-        cmp eax, 9999
-        jle terminate_string
-        inc edi
-        cmp eax, 99999
-        jle terminate_string
-        inc edi
-        cmp eax, 999999
-        jle terminate_string
-        inc edi
-        cmp eax, 9999999
-        jle terminate_string
-        inc edi
-        cmp eax, 99999999
-        jle terminate_string
-        inc edi
-        cmp eax, 999999999
-        jle terminate_string
-        inc edi
-
-        terminate_string:
-        mov [edi + 1], byte 0
-
-        ; Start writing bytes to the buffer from least to most significant
-        ; digit (right to left)
-        divide_loop:
-        ; Else divide edx:eax by 10
+        ; This is our divisor
+        mov ebx, 10
         ; eax: quotient contains the rest of input number
         ; edx: remainder contains the digit we want to write
-        xor edx, edx
-        div ecx
-        add dl, byte '0'
-        mov [edi], byte dl
-        dec edi
-        ; Stop if we reached the start of the buffer
-        cmp edi, esi
-        jge divide_loop
+        .loop:
+                xor edx, edx
+                div ebx
+                add dl, byte '0'
+                dec esp
+                mov [esp], byte dl
+                inc ecx
+                ; Stop if eax is 0
+                cmp eax, 0
+                jne .loop
+        ; Copy chars on stack to destination buffer
+        ; They will be in order because stack grows down
+        mov esi, esp
+        mov edi, [ebp + 12]
+        repne movsb
+        ; Realign stack pointer
+        mov esp, esi
 
-        pop edi
         pop esi
+        pop edi
+        pop ebx
         mov esp, ebp
         pop ebp
         ret
