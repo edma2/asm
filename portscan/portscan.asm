@@ -487,6 +487,7 @@ connect_scan:
                 jmp exit
 
 syn_scan:
+        ; Prepare the raw TCP packet to send
 
 exit:
         mov ebp, esp
@@ -822,7 +823,7 @@ free_all_sockets:
         sub ecx, 4
         jmp .find
 
-        ; Loop through all 1024 (Todo: this is slow!) bits in fdset
+        ; Loop through remaining bits in fdset
         .loop:
                 ; Clear bit to zero and store original bit in CF
                 btr [masterfds], eax
