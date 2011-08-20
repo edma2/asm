@@ -322,6 +322,11 @@ ping_host:
         ; Check return value
         test eax, eax
         js ping_recv_failed
+        ; Swipe the IP address from the ICMP packet we recieved 
+        ; This should get the destination address field of the IP header
+        lea esi, [recvbuf + 16]
+        mov edi, myaddr
+        movsd
         jmp ping_cleanup
                 
         ping_recv_failed:
@@ -350,7 +355,7 @@ connect_scan:
                 xor edi, edi 
                 gather_sockets:
                         ; Create socket with arguments
-                        ; PF_INET, SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
+                        ; SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
                         push dword 6 
                         push dword (1 | 4000q) 
                         call spawn_socket
@@ -516,13 +521,6 @@ connect_scan:
                 jmp exit
 
 syn_scan:
-        ;;; Swipe the IP address from the ICMP packet we recieved ;;;
-
-        ; This should get the destination address field of the IP header
-        lea esi, [recvbuf + 16]
-        mov edi, myaddr
-        movsd
-
         ;;; Set up psuedo-random number generator ;;;
 
         ; O_RDONLY
@@ -565,7 +563,7 @@ syn_scan:
         ; ACK = 0
         xor eax, eax
         stosd
-        ; Data offset = 5 (<< 4)
+        ; Data offset = 5 << 4 (length of header in dwords)
         mov al, 0x5
         shl al, 4
         stosb
@@ -582,6 +580,31 @@ syn_scan:
         stosw
         ; Urgent pointer = 0 (not used)
         stosw
+
+        ;;; Prepare TCP psuedo-header ;;;
+        ; struct pseudo_hdr {
+        ;       u_int32_t src;          /* 32bit source ip address*/
+        ;       u_int32_t dst;          /* 32bit destination ip address */      
+        ;       u_char mbz;             /* 8 reserved bits (all 0)      */
+        ;       u_char proto;           /* protocol field of ip header */
+        ;       u_int16_t len;          /* tcp length (both header and data) */
+        ; }
+        ; Load source ip address
+        mov eax, [myaddr]
+        stosd
+        ; Load destination ip address
+        mov eax, [victimaddr]
+        stosd
+        ; 8 reserved bits (all 0)
+        xor eax, eax
+        stosb
+        ; Protocol field of ip header = IPPROTO_TCP
+        mov al, 6
+        lodsb
+        ; Length of TCP header and data (20 + 0) in bytes
+        mov ax, 0x14 
+        xchg al, ah
+        lodsw
 
         ;;; Caculate TCP header checksum ;;;
         
