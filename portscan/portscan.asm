@@ -30,10 +30,10 @@ section .bss
         sockaddr:               resb (2+2+4+8)
         sockaddrlen             equ $-sockaddr
 
-        ; Socket Bitmap Interface: bitmaps that are usually passed to the
-        ; select() system call to monitor open sockets. They also provide our
-        ; interface for opening and closing sockets, exposed through
-        ; spawn_socket(), free_socket(), and free_all_sockets().
+        ; Socket Bitmap Interface: Bitmaps are usually passed to the select()
+        ; system call to monitor open sockets. They also provide our interface
+        ; for opening and closing sockets, exposed through spawn_socket(),
+        ; free_socket(), and free_all_sockets().
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
@@ -242,10 +242,6 @@ ping_host:
         ; remaining. Furthermore, we only care about the first reply we get,
         ; and ignore the rest.
 
-        ; Add socket to readfds
-        mov eax, [icmp_socket]
-        bts [readfds], eax
-
         ; Initialize tv_usec to maximum timeout 
         mov edi, timeout_volatile
         xor eax, eax
@@ -253,6 +249,11 @@ ping_host:
         mov eax, max_timeout
         stosd
 
+        ; Copy masterfds to readfds
+        mov esi, masterfds
+        mov edi, readfds
+        mov ecx, masterfdslen
+        rep movsd
         ; Block until data is ready to be read, or we exceed timeout
         push timeout_volatile       
         push dword 0                    
@@ -355,8 +356,6 @@ connect_scan:
                         ; Update nfds: max(nfds, fd)
                         cmp eax, edi
                         cmovg edi, eax
-                        ; Add socket to writefds
-                        bts [writefds], eax
 
                         attempt_connect:
                         ; Initiate TCP handshake to port
@@ -407,16 +406,13 @@ connect_scan:
                 call sys_select
                 add esp, 20
 
-
-                call_select: 
-                ; Wake up and smell the ashes...
-                ; Time to check up on our sockets
                 ; Copy masterfds to writefds 
                 mov esi, masterfds
                 mov edi, writefds
                 mov ecx, masterfdslen
                 rep movsd
-                ; Call select
+                ; Wake up and smell the ashes...
+                ; Time to check up on our sockets
                 push timeout_zero
                 push dword 0
                 push dword writefds
