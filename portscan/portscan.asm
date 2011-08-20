@@ -395,15 +395,16 @@ connect_scan:
                 call sys_select
                 add esp, 20
 
+
+                call_select: 
+                ; Wake up and smell the ashes...
+                ; Time to check up on our sockets
                 ; Copy masterfds to writefds 
                 mov esi, masterfds
                 mov edi, writefds
                 mov ecx, masterfdslen
                 rep movsd
-
-                call_select: 
-                ; Wake up and smell the ashes...
-                ; Time to check up on our sockets
+                ; Call select
                 push timeout_zero
                 push dword 0
                 push dword writefds
@@ -414,6 +415,7 @@ connect_scan:
                 call sys_select
                 add esp, 20
 
+                ; Check return value
                 cmp eax, 0
                 ; All sockets will block on write, skip to next iteration
                 je connect_scan_cleanup
@@ -482,6 +484,9 @@ connect_scan:
                 ; Check if we're done
                 cmp bx, word 1024 
                 jl connect_scan_loop
+                jmp exit
+
+syn_scan:
 
 exit:
         mov ebp, esp
@@ -715,7 +720,7 @@ ultostr:
         mov ecx, 10
 
         ; Fairly self-explanatory, right?
-        calculate_number_of_digits:
+        count_digits:
         cmp eax, 9
         jle terminate_string
         inc edi
@@ -1167,7 +1172,4 @@ recv_packet:
 send_tcp_raw_syn:
         ret
 ; ------------------------------------------------------------------------------
-
-syn_scan:
-        ret
 ; EOF ==========================================================================
