@@ -28,7 +28,7 @@ section .data
         ; some port. Ignoring strange and unusual circumstances, this port
         ; should be closed.
         magic_number:           dw 31337
-        ; The (psuedo-)random number generator we will use. urandom(4) will be
+        ; The (pseudo-)random number generator we will use. urandom(4) will be
         ; sufficient and cheap enough for our purposes. (We don't want to
         ; exhaust our entropy pool!)
         devrpath:               db '/dev/urandom', 0
@@ -521,7 +521,7 @@ connect_scan:
                 jmp exit
 
 syn_scan:
-        ;;; Set up psuedo-random number generator ;;;
+        ;;; Set up pseudo-random number generator ;;;
 
         ; O_RDONLY
         push dword 0
@@ -581,7 +581,7 @@ syn_scan:
         ; Urgent pointer = 0 (not used)
         stosw
 
-        ;;; Prepare TCP psuedo-header ;;;
+        ;;; Prepare TCP pseudo-header ;;;
         ; struct pseudo_hdr {
         ;       u_int32_t src;          /* 32bit source ip address*/
         ;       u_int32_t dst;          /* 32bit destination ip address */      
@@ -596,7 +596,7 @@ syn_scan:
         mov eax, [victimaddr]
         stosd
         ; 8 reserved bits (all 0)
-        xor eax, eax
+        xor al, al
         stosb
         ; Protocol field of ip header = IPPROTO_TCP
         mov al, 6
@@ -606,7 +606,7 @@ syn_scan:
         xchg al, ah
         lodsw
 
-        ;;; Caculate TCP header checksum ;;;
+        ;;; Caculate TCP header + pseudo-header checksum ;;;
         
 exit:
         mov ebp, esp
