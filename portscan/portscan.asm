@@ -5,6 +5,9 @@
 ; ==============================================================================
 
 section .data
+        ; Error messages that should probably be more informative. However,
+        ; usually, along with this error message, errno(3) will be returned to
+        ; the shell
         open_error_msg:         db 'Error: sys_open failed', 10, 0
         socket_error_msg:       db 'Error: sys_socket failed', 10, 0
         select_error_msg:       db 'Error: sys_select failed', 10, 0
@@ -12,18 +15,29 @@ section .data
         connect_error_msg:      db 'Error: unexpected connect error', 10, 0
         sendto_error_msg:       db 'Error: sys_sendto failed', 10, 0
         recvfrom_error_msg:     db 'Error: sys_recvfrom failed', 10, 0
-        usage_string:           db 'Usage: portscan <target ip>', 10, 0
+        usage_msg:              db 'Usage: portscan <target ip>', 10, 0
+        ; For printing newlines after we print a number or something
         newline_msg:            db 10, 0
-
+        ; recvfrom(2) wants us to provide it with the ADDRESS of the length of
+        ; the sockaddr, for some wierd reason.
         sockaddrlen_addr:       dd sockaddrlen
+        ; This is the source port that we include with the TCP header when
+        ; sending raw packets. We will receieve all TCP packets via raw
+        ; sockets, so what this really does is prevent a copy of the packet
+        ; from being routed to another process that happens to be active on
+        ; some port. Ignoring strange and unusual circumstances, this port
+        ; should be closed.
         magic_number:           dw 31337
-        devrpath:               db '/dev/random', 0
+        ; The (psuedo-)random number generator we will use. urandom(4) will be
+        ; sufficient and cheap enough for our purposes. (We don't want to
+        ; exhaust our entropy pool!)
+        devrpath:               db '/dev/urandom', 0
 
 ; ==============================================================================
 
 section .bss
         ; The socket address structure that needs to be filled in before making
-        ; socket calls.
+        ; socket calls, or sending and receiving packets.
         ; struct sockaddr_in {
         ;       short int          sin_family;  // Address family, AF_INET
         ;       unsigned short int sin_port;    // Port number
@@ -32,7 +46,6 @@ section .bss
         ; };
         sockaddr:               resb (2+2+4+8)
         sockaddrlen             equ $-sockaddr
-
         ; Socket Bitmap Interface: Bitmaps are usually passed to the select()
         ; system call to monitor open sockets. They also provide our interface
         ; for opening and closing sockets, exposed through spawn_socket(),
@@ -41,25 +54,21 @@ section .bss
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
         masterfds:              resd 32
-        writefds:               resd 32                
-        readfds:                resd 32                 
+        wrfds:                  resd 32                
+        rdfds:                  resd 32                 
         masterfdslen            equ 32                       
-
         ; Maximum number of sockets to open at once
-        max_sockets             equ 64
+        max_parallel_sockets    equ 64
         ; Use this in tcp connect scan to map each open socket to a port
-        live_sockets:           resd max_sockets        
-        live_ports:             resw max_sockets        
-        ; Storage for socket we use when we ICMP ping
+        live_sockets:           resd max_parallel_sockets        
+        live_ports:             resw max_parallel_sockets        
+        ; Storage for a copy of the ICMP socket file descriptor 
         icmp_socket:            resd 1
-
-        ; Addresses in network byte order
+        ; Source and target IPv4 addresses in network byte order
         victimaddr:             resd 1                  
         myaddr:                 resd 1                 
-        
-        ; Temporary place where we store our strings
-        write_buffer:           resb 12                 
-
+        ; Temporary storage for strings
+        write_buffer:           resb 256                 
         ; struct timeval {
         ;     int tv_sec;     // seconds
         ;     int tv_usec;    // microseconds
@@ -72,21 +81,19 @@ section .bss
         timeout_master:         resd 2
         ; Maximum time to wait for incoming packets in usec
         max_timeout             equ 500000      
-
         ; Packet Delivery Interface
-        ; Fill out these buffers and lengths before sending or receiving packets
-        sendpacket:             resb 1024               
-        sendpacketlen:          resd 1                 
-        recvpacket:             resb 1024             
-        recvpacketlen:          resd 1               
-
+        ; Fill out these buffers before sending or receiving packets
+        sendbuf:                resb 1024               
+        recvbuf:                resb 1024             
+        ; Number of bytes to send/expect
+        sendbuflen:             resd 1                 
+        recvbuflen:             resd 1               
         ; For storing the file descriptor mapped to /dev/random
         devrfd:                 resd 1
-
         ; Some useful constants that tell us header sizes
         iphdrlen                equ 20                  
         icmphdrlen              equ 8                  
-        ; Errnos we expect to see when using non-blocking sockets
+        ; Error numbers we expect to see when using non-blocking sockets
         EINPROGRESS             equ -115
         EAGAIN                  equ -11
 
@@ -107,9 +114,10 @@ check_argc:
         jmp parse_argv
         
         wrong_argument_count:
-        ; Set exit code to -1 and exit
+        ; Print usage string
+        ; Exit with exit code 1
         push dword -1 
-        push dword usage_string
+        push dword usage_msg
         call premature_exit
 
 parse_argv:
@@ -127,6 +135,7 @@ parse_argv:
         malformed_ip_error:
         ; The IPv4 address didn't look right
         ; Print error message complaining about malformed ip
+        ; Exit with exit code 1
         push dword -1
         push dword parse_error_msg            
         call premature_exit                  
@@ -144,7 +153,7 @@ load_sockaddr:
         mov eax, [victimaddr]
         stosd
 
-get_dynamic_timeout:
+get_timeout:
         ; If we're root, use ICMP ping to get optimal timeout 
         call sys_getuid
         cmp eax, 0
@@ -178,6 +187,7 @@ ping_host:
 
         create_icmp_socket_failed:
         ; We had trouble creating the socket, print error message and exit
+        ; Save socket(2) -errno on stack
         push eax 
         push socket_error_msg
         call premature_exit
@@ -186,7 +196,7 @@ ping_host:
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
         ; will craft the IP header for us because IP_HDRINCL is disabled by
         ; default, so we don't build the IP header.
-        mov edi, sendpacket            
+        mov edi, sendbuf            
         ; Type: 8 (Echo request)
         mov al, 8                     
         stosb                           
@@ -204,14 +214,14 @@ ping_host:
         rep stosd                       
         ; Calculate ICMP checksum which includes ICMP header and data
         push dword ((icmphdrlen+56)/2)
-        push dword sendpacket        
+        push dword sendbuf        
         call cksum                     
         add esp, 8                  
         ; Store result in packet ICMP header
-        mov [sendpacket + 2], word ax   
+        mov [sendbuf + 2], word ax   
         ; Before sending/receiving packets, store the length after filling out
         ; the packet.
-        mov [sendpacketlen], dword (icmphdrlen + 56)
+        mov [sendbuflen], dword (icmphdrlen + 56)
 
         ;;; Send the packet thrice through the created ICMP socket ;;;
 
@@ -236,6 +246,7 @@ ping_host:
 
         ping_send_failed:
         ; We had trouble sending data to host, print error message and exit
+        ; Save sendto(2) -errno on stack
         push eax
         push sendto_error_msg
         call premature_exit
@@ -255,16 +266,16 @@ ping_host:
         mov eax, max_timeout
         stosd
 
-        ; Copy masterfds to readfds
+        ; Copy masterfds to rdfds
         mov esi, masterfds
-        mov edi, readfds
+        mov edi, rdfds
         mov ecx, masterfdslen
         rep movsd
         ; Block until data is ready to be read, or we exceed timeout
         push timeout_volatile       
         push dword 0                    
         push dword 0                   
-        push readfds                  
+        push rdfds                  
         push dword [icmp_socket]
         inc dword [esp]
         call sys_select                 
@@ -278,6 +289,7 @@ ping_host:
 
         ping_select_failed:
         ; Something went wrong with select(2), print error message and exit
+        ; Save select(2) errno on stack
         push eax
         push dword select_error_msg
         call premature_exit
@@ -300,9 +312,9 @@ ping_host:
         shl eax, 2
         mov [timeout_master + 4], eax   
 
-        ; Data will be stored in recvpacket
+        ; Data will be stored in recvbuf
         ; Set number of bytes we expect to receive in packet
-        mov [recvpacketlen], dword (iphdrlen+icmphdrlen+56)
+        mov [recvbuflen], dword (iphdrlen+icmphdrlen+56)
         push dword [icmp_socket]
         call recv_packet
         add esp, 4
@@ -314,6 +326,7 @@ ping_host:
                 
         ping_recv_failed:
         ; recvfrom(2) failed, print error message and exit
+        ; Save recvfrom(2) errno on stack
         push eax
         push dword recvfrom_error_msg
         call premature_exit
@@ -351,6 +364,7 @@ connect_scan:
 
                         socket_create_error:
                         ; We had trouble creating the socket
+                        ; Save socket(2) errno on stack
                         push eax 
                         push socket_error_msg
                         call premature_exit
@@ -387,7 +401,7 @@ connect_scan:
 
                         wrong_errno:
                         ; Connect failed for reasons other than being "in progress"
-                        ; Save -errno on stack
+                        ; Save connect(2) -errno on stack
                         push eax 
                         push connect_error_msg
                         call premature_exit
@@ -396,7 +410,7 @@ connect_scan:
                         connect_in_progress:
                         ; "Gather" next socket-port combination or proceed to next step
                         inc word bx
-                        cmp esi, max_sockets
+                        cmp esi, max_parallel_sockets
                         jl gather_sockets
 
                 wait_for_connections:
@@ -413,16 +427,16 @@ connect_scan:
                 call sys_select
                 add esp, 20
 
-                ; Copy masterfds to writefds 
+                ; Copy masterfds to wrfds 
                 mov esi, masterfds
-                mov edi, writefds
+                mov edi, wrfds
                 mov ecx, masterfdslen
                 rep movsd
                 ; Wake up and smell the ashes...
                 ; Time to check up on our sockets
                 push timeout_zero
                 push dword 0
-                push dword writefds
+                push dword wrfds
                 push dword 0
                 ; nfds = maximum fd + 1
                 inc edi 
@@ -438,20 +452,20 @@ connect_scan:
 
                 select_error:
                 ; We had some sort of trouble with select(2)
-                ; Save -errno on stack and kill all sockets
+                ; Save select(2) -errno on stack 
                 push eax
                 push select_error_msg
                 call premature_exit
 
                 check_for_connected_sockets:
-                ; Check writefds for our sockets
+                ; Check wrfds for our sockets
                 ; Reset index into socket array
                 xor esi, esi
                 iterate_through_fds:
                         check_if_write_blocks:
                         ; Fetch file descriptor
                         mov eax, [live_sockets + 4 * esi]
-                        bt [writefds], eax
+                        bt [wrfds], eax
 
                         ; This port didn't respond to our TCP request:
                         ; this means it was probably filtered
@@ -490,7 +504,7 @@ connect_scan:
                         port_was_closed:
                         check_next_socket:
                         inc esi
-                        cmp esi, max_sockets
+                        cmp esi, max_parallel_sockets
                         jl iterate_through_fds
 
                 connect_scan_cleanup:
@@ -505,30 +519,29 @@ syn_scan:
         ;;; Swipe the IP address from the ICMP packet we recieved ;;;
 
         ; This should get the destination address field of the IP header
-        mov eax, [recvpacket + 16]
-        mov [myaddr], eax
+        lea esi, [recvbuf + 16]
+        mov edi, myaddr
+        movsd
 
         ;;; Set up psuedo-random number generator ;;;
-        setup_random_number_generator:
+
         ; O_RDONLY
         push dword 0
-        ; "/dev/random"
+        ; "/dev/urandom"
         push dword devrpath
         call sys_open
         add esp, 8
         
         ; Check return value 
         test eax, eax
-        js open_devr_failed
+        js failed_to_open_dev_random
         ; Save the returned file descriptor
         mov [devrfd], eax
         jmp build_tcp_packet
         
+        failed_to_open_dev_random:
         ; We were unable to open /dev/random
-        open_devr_failed:
-        ; Convert -errno to errno
-        not eax
-        inc eax
+        ; Save open(2) -errno on stack
         push dword eax
         push dword open_error_msg
         call premature_exit
@@ -537,7 +550,7 @@ syn_scan:
 
         build_tcp_packet:
         ; Prepare the raw TCP packet to send
-        mov edi, sendpacket
+        mov edi, sendbuf
         ; Load the source port
         mov eax, magic_number
         xchg al, ah
@@ -930,8 +943,8 @@ free_all_sockets:
 
 ; ------------------------------------------------------------------------------
 ; premature_exit:
-;       Print error message, clean up sockets, then exit with exit code
-;               Expects: error msg, exit code
+;       Print error message, clean up file descriptors, then exit with exit code
+;               Expects: error msg, -errno
 ;               Returns: nothing
 premature_exit:
         push ebp
@@ -952,8 +965,13 @@ premature_exit:
         ; Free all open sockets (raw, icmp, tcp, etc...)
         clean_up_sockets:
         call free_all_sockets
-        mov eax, 1
+
+        ; Convert -errno to errno
         mov ebx, [ebp + 12]
+        not ebx
+        inc ebx
+        ; Exit and send errno to shell
+        mov eax, 1
         int 0x80
 
 ; ------------------------------------------------------------------------------
@@ -1115,7 +1133,7 @@ sys_socket:
 ; ------------------------------------------------------------------------------
 ; sys_select:
 ;       Wrapper around sys_select
-;               Expects: int nfds, fd_set *readfds, fd_set *writefds,
+;               Expects: int nfds, fd_set *rdfds, fd_set *wrfds,
 ;                       fd_set *exceptfds, struct timeval *timeout
 ;               Returns: total number of fildes set in fd_set structs, -errno if error
 sys_select:
@@ -1209,8 +1227,8 @@ sys_setsockopt:
 ;       Send a packet to target host
 ;               Expects: stack - socket
 ;                        sockaddr - points to target host
-;                        sendpacket - filled out for us
-;                        sendpacketlen - filled out for us
+;                        sendbuf - filled out for us
+;                        sendbuflen - filled out for us
 ;               Returns: number of bytes sent, or -errno
 send_packet:
         push ebp
@@ -1219,8 +1237,8 @@ send_packet:
         push dword sockaddrlen          ; Socket address length
         push dword sockaddr             ; Socket address
         push dword 0                    ; No flags
-        push dword [sendpacketlen]      ; Number of bytes to send
-        push dword sendpacket           ; Packet start
+        push dword [sendbuflen]      ; Number of bytes to send
+        push dword sendbuf           ; Packet start
         push dword [ebp + 8]            ; Socket
         call sys_sendto                 ; Send data asynchronously
         add esp, 24            
@@ -1235,8 +1253,8 @@ send_packet:
 ;       Receive a packet from target host
 ;               Expects: stack - socket
 ;                        sockaddr - points to target host
-;                        recvpacket - filled out for us
-;                        recvpacketlen - filled out for us
+;                        recvbuf - filled out for us
+;                        recvbuflen - filled out for us
 ;               Returns: number of bytes received, or -errno
 recv_packet:
         push ebp
@@ -1245,8 +1263,8 @@ recv_packet:
         push dword sockaddrlen_addr     ; Socket address length
         push dword sockaddr             ; Socket address
         push dword 0                    ; No flags
-        push dword [recvpacketlen]      ; Socket
-        push dword recvpacket           ; Packet start
+        push dword [recvbuflen]      ; Socket
+        push dword recvbuf           ; Packet start
         push dword [ebp + 8]            ; Socket
         call sys_recvfrom               ; Send data asynchronously
         add esp, 24            
