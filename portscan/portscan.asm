@@ -600,13 +600,19 @@ syn_scan:
         stosb
         ; Protocol field of ip header = IPPROTO_TCP
         mov al, 6
-        lodsb
+        stosb
         ; Length of TCP header and data (20 + 0) in bytes
-        mov ax, 0x14 
+        mov ax, 20
         xchg al, ah
-        lodsw
+        stosw
 
-        ;;; Caculate TCP header + pseudo-header checksum ;;;
+        ;;; Calculate TCP header + pseudo-header checksum ;;;
+        push dword (20+12)
+        push sendbuf
+        call cksum
+        add esp, 8
+        ; Store checksum in TCP header
+        mov [sendbuf + 16], ax
         
 exit:
         mov ebp, esp
