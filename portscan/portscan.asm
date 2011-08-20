@@ -88,7 +88,7 @@ section .bss
         ; Number of bytes to send/expect
         sendbuflen:             resd 1                 
         recvbuflen:             resd 1               
-        ; For storing the file descriptor mapped to /dev/random
+        ; For storing the file descriptor mapped to /dev/urandom
         devrfd:                 resd 1
         ; Some useful constants that tell us header sizes
         iphdrlen                equ 20                  
@@ -534,13 +534,13 @@ syn_scan:
         
         ; Check return value 
         test eax, eax
-        js failed_to_open_dev_random
+        js failed_to_open_devr
         ; Save the returned file descriptor
         mov [devrfd], eax
         jmp build_tcp_packet
         
-        failed_to_open_dev_random:
-        ; We were unable to open /dev/random
+        failed_to_open_devr:
+        ; We were unable to open /dev/urandom
         ; Save open(2) -errno on stack
         push dword eax
         push dword open_error_msg
@@ -913,11 +913,11 @@ free_all_sockets:
         lea ecx, [masterfds + masterfdslen]
         ; Find dword containing highest numbered file descriptor
         .find:
-        cmp [ecx], dword 0
-        jnz .loop
-        sub eax, 32
-        sub ecx, 4
-        jmp .find
+                cmp [ecx], dword 0
+                jnz .loop
+                sub eax, 32
+                sub ecx, 4
+                jmp .find
 
         ; Loop through remaining bits in fdset
         .loop:
@@ -955,7 +955,7 @@ premature_exit:
         call printstr
         add esp, 4
         
-        ; Close file descriptor mapped to /dev/random if open
+        ; Close file descriptor mapped to /dev/urandom if open
         cmp [devrfd], dword 0
         je clean_up_sockets
         push dword [devrfd]
@@ -1276,9 +1276,9 @@ recv_packet:
 
 ; ------------------------------------------------------------------------------
 ; rand
-;       Get a random 32-bit integer from /dev/random
+;       Get a random 32-bit integer from /dev/urandom
 ;               Expects: stack - nothing 
-;                        devrfd - fd with read perms mapped to /dev/random 
+;                        devrfd - fd with read perms mapped to /dev/urandom 
 ;               Returns: random int in eax
 rand:
         push ebp
