@@ -21,13 +21,6 @@ section .data
         ; recvfrom(2) wants us to provide it with the ADDRESS of the length of
         ; the sockaddr, for some wierd reason.
         sockaddrlen_addr:       dd sockaddrlen
-        ; This is the source port that we include with the TCP header when
-        ; sending raw packets. We will receieve all TCP packets via raw
-        ; sockets, so what this really does is prevent a copy of the packet
-        ; from being routed to another process that happens to be active on
-        ; some port. Ignoring strange and unusual circumstances, this port
-        ; should be closed.
-        magic_number:           dw 31337
         ; The (pseudo-)random number generator we will use. urandom(4) will be
         ; sufficient and cheap enough for our purposes. (We don't want to
         ; exhaust our entropy pool!)
@@ -171,7 +164,7 @@ ping_host:
 
         create_icmp_socket:
         ; To create a raw socket, user need root permissions
-        ; PF_INET, SOCK_RAW|O_NONBLOCK, IPPROTO_ICMP
+        ; SOCK_RAW|O_NONBLOCK, IPPROTO_ICMP
         push dword 1                    
         push dword (3 | 4000q)         
         call spawn_socket                 
@@ -521,8 +514,31 @@ connect_scan:
                 jmp exit
 
 syn_scan:
+        ;;; Create raw socket with TCP protcol ;;;
+        ; SOCK_RAW, IPPROTO_TCP
+        push dword 6
+        push dword 3
+        call spawn_socket
+        add esp, 8
+        
+        ; Check return value
+        test eax, eax                   
+        ; Give up immediately if we couldn't create a raw tcp socket
+        js create_tcp_socket_failed
+        ; Store the raw socket file descriptor in live_sockets array
+        mov [live_sockets], eax             
+        jmp setup_random_number_generator
+
+        create_tcp_socket_failed:
+        ; We had trouble creating the socket, print error message and exit
+        ; Save socket(2) -errno on stack
+        push eax 
+        push socket_error_msg
+        call premature_exit
+
         ;;; Set up pseudo-random number generator ;;;
 
+        setup_random_number_generator:
         ; O_RDONLY
         push dword 0
         ; "/dev/urandom"
@@ -550,7 +566,7 @@ syn_scan:
         ; Prepare the raw TCP packet to send
         mov edi, sendbuf
         ; Load the source port
-        mov eax, magic_number
+        mov ax, 31337
         xchg al, ah
         stosw
         ; Load the destination port (80)
@@ -571,9 +587,9 @@ syn_scan:
         xor al, al
         or al, 0x2
         stosb
-        ; Max window size = 0xffff
-        xor ax, ax
-        not ax
+        ; Max window size = 4096 bytes
+        mov ax, 4096
+        xchg al, ah
         stosw
         ; Checksum = 0
         xor ax, ax
@@ -613,7 +629,21 @@ syn_scan:
         add esp, 8
         ; Store checksum in TCP header
         mov [sendbuf + 16], ax
-        
+
+        ; Set the length in bytes to send
+        mov [sendbuflen], dword 20
+
+        ;;; Send the SYN packet! ;;;
+        push dword [live_sockets]
+        call send_packet
+        add esp, 4
+
+        ;;; Receive the SYN/ACK reply! ;;;
+        mov [sendbuflen], dword 1024
+        push dword [live_sockets]
+        call recv_packet
+        add esp, 4
+
 exit:
         mov ebp, esp
         mov eax, 1
@@ -626,31 +656,45 @@ exit:
 ;               Expects: pointer to data, data length in words 
 ;               Returns: checksum 
 cksum:
-        push ebp                ; Save frame pointer
-        mov ebp, esp            ; Set new frame pointer
-        push esi                ; Preserve esi
+        push ebp
+        mov ebp, esp
+        push esi
 
-        mov esi, [ebp + 8]      ; Load data pointer        
-        mov ecx, [ebp + 12]     ; Load data length
+        ; Address
+        mov esi, [ebp + 8]
+        ; Length
+        mov ecx, [ebp + 12]
+        ; The accumulator
+        xor edx, edx
 
-        cmp ecx, 0              ; Check word counter
-        je .done                ; Exit immediately if 0 was passed as argument
-
-        xor dx, dx              ; Accumulate result in dx
+        ; For the strange condition that length given was zero
+        cmp ecx, 0
+        jz .done
         .loop:
-                lodsw           ; Load next word into ax
-                add dx, ax      ; Perform 16-bit (word size) addition 
-                dec ecx
-                jnz .loop       ; Repeat next word
-        
-        .done:
-        not dx                  ; Take one's complement of result
-        movzx eax, dx           ; Save result in return register
+                xor eax, eax
+                ; Load esi to lower 16 bis of eax
+                lodsw
+                add edx, eax
+                dec ecx 
+                jnz .loop
 
-        pop esi                 ; Restore esi
-        mov esp, ebp            ; Deallocate local storage
-        pop ebp                 ; Restore old frame pointer
-        ret                     ; Return
+        ; Take the upper 16 bits of edx and add it to lower 16 bits
+        mov eax, edx
+        and eax, 0xffff
+        shr edx, 16
+        add eax, edx
+        ; Take care of the carry
+        mov edx, eax
+        shr edx, 16
+        add eax, edx
+        ; Take the one's complement
+        not eax
+
+        .done:
+        pop esi
+        mov esp, ebp
+        pop ebp
+        ret
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
