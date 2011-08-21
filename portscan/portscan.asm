@@ -89,6 +89,9 @@ section .bss
         ; Error numbers we expect to see when using non-blocking sockets
         EINPROGRESS             equ -115
         EAGAIN                  equ -11
+        ; Pass as an argument to send_tcp_raw as packet type
+        TH_SYN                  equ 0x2 
+        TH_RST                  equ 0x3 
 
 ; ==============================================================================
 
@@ -514,10 +517,10 @@ connect_scan:
                 jmp exit
 
 syn_scan:
-        ;;; Create raw socket with TCP protcol ;;;
-        ; SOCK_RAW, IPPROTO_TCP
+        ;;; Create raw socket with TCP protocol ;;;
+        ; SOCK_RAW|NON_BLOCK, IPPROTO_TCP
         push dword 6
-        push dword 3
+        push dword (3|4000q)
         call spawn_socket
         add esp, 8
         
@@ -548,29 +551,81 @@ syn_scan:
         
         ; Check return value 
         test eax, eax
-        js failed_to_open_devr
-        ; Save the returned file descriptor
-        mov [devrfd], eax
-        jmp build_tcp_packet
-        
-        failed_to_open_devr:
+        jns store_devrfd
+
         ; We were unable to open /dev/urandom
         ; Save open(2) -errno on stack
         push dword eax
         push dword open_error_msg
         call premature_exit
 
-        ;;; Prepare the TCP header ;;;
+        store_devrfd:
+        ; Save the returned file descriptor
+        mov [devrfd], eax
 
-        build_tcp_packet:
+        ;;; Send out all our SYN packets at once ;;;
+
+        ; ebx = current port 
+        ; ebx will iterate through ports 0-1023
+        xor ebx, ebx
+        send_syn_packet_loop:
+                push dword TH_SYN
+                push dword ebx
+                push dword [live_sockets]
+                call send_tcp_raw
+                add esp, 12
+                        
+                cmp eax, EINPROGRESS   
+                je prepare_next_port
+                cmp eax, EAGAIN
+                je prepare_next_port
+                test eax, eax
+                jns prepare_next_port
+        
+                ; We had issues sending a SYN packet to the victim
+                ; Push sendto(2) -errno on stack
+                push eax
+                push dword sendto_error_msg
+                call premature_exit
+
+                prepare_next_port:
+                ; Everything seems normal, send a packet to the next port
+                inc ebx
+                cmp ebx, 1024
+                jne send_syn_packet_loop
+
+        ; Close file descriptor mapped to /dev/urandom 
+        push dword [devrfd]
+        call sys_close
+        add esp, 4
+        call free_all_sockets
+
+exit:
+        mov ebp, esp
+        mov eax, 1
+        xor ebx, ebx
+        int 0x80
+
+; ------------------------------------------------------------------------------
+; send_tcp_raw
+;       Send a raw tcp header to the specified port
+;               Expects: stack - socket file descriptor, port, type
+;                        devrfd - contains file descriptor mapped to random
+;                        number generator device
+;               Returns: number of bytes sent in eax, or -errno on error
+send_tcp_raw:
+        push ebp
+        mov ebp, esp
+        push edi
+
         ; Prepare the raw TCP packet to send
         mov edi, sendbuf
         ; Load the source port
         mov ax, 31337
         xchg al, ah
         stosw
-        ; Load the destination port (80)
-        mov ax, 80
+        ; Load the destination port
+        mov ax, [ebp + 12]
         xchg al, ah
         stosw
         ; SEQ = rand()
@@ -583,9 +638,9 @@ syn_scan:
         mov al, 0x5
         shl al, 4
         stosb
-        ; Flags SYN = 1
+        ; Flags = type; 0x2 = SYN, 0x3 = RST
         xor al, al
-        or al, 0x2
+        or al, [ebp + 16]
         stosb
         ; Max window size = 4096 bytes
         mov ax, 4096
@@ -634,21 +689,16 @@ syn_scan:
         mov [sendbuflen], dword 20
 
         ;;; Send the SYN packet! ;;;
-        push dword [live_sockets]
+        push dword [ebp + 8]
         call send_packet
         add esp, 4
 
-        ;;; Receive the SYN/ACK reply! ;;;
-        mov [sendbuflen], dword 1024
-        push dword [live_sockets]
-        call recv_packet
-        add esp, 4
+        pop edi
+        mov esp, ebp
+        pop ebp
+        ret
 
-exit:
-        mov ebp, esp
-        mov eax, 1
-        xor ebx, ebx
-        int 0x80
+; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
 ; cksum:  
