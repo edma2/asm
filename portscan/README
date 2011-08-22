@@ -1,8 +1,45 @@
-portscan
-by Eugene Ma
-===================
-A port scanner that implements the TCP connect(2) scanning method using
-multiple sockets in parallel to achieve fast scan rates (approximately 100
-ports per second). Written entirely in 32-bit x86 assembly (NASM). 
-portscan was written primarily for educational benefit, but may be fast, and is
-at least comparable to nmap speeds. 
+
+asmscan
+Author: Eugene Ma
+
+==========[ 0x1 Introduction ]
+
+asmscan is a port scanner written entirely in 32-bit x86 assembly. It uses pure
+Linux system calls to interface with the operating system, rendering it
+incompatible with other operating systems or microprocessor architectures.
+However, compared with other port scanner software, asmscan has the advantage
+of being completely libc free, and is never linked with an external library
+such as glibc.
+
+==========[ 0x2 Operation ]
+
+asmscan implements two modes of operation. 
+
+1. In non-root user mode, asmscan will perform what is known as a TCP scan, and
+attempts to establish TCP connections with ports 0-1023. If a given connection
+is successful, the port is considered open. There are simple heuristics for
+inferring whether a port is closed or filtered, but asmscan does not expose
+this information at this time.  
+
+2. In root user mode, asmscan has the root-level permissions necessary to craft
+packet headers. It will first ping the target host with a custom ICMP echo
+packet and wait for a response, using the round trip time to estimate the
+network latency. 
+
+asmscan will then pretend to initiate TCP connections by sending SYN packets to
+ports 0-1023 of the target host. For each port, we wait for a response. This
+duration is calculated from the previous ICMP ping.
+
+If we don't get a response in time, our packet was probably dropped by a
+firewall and we consider the port filtered. In the case we do get a response,
+we examine the received packet for the SYN and ACK flags in the TCP header. If
+these flags are on, it is implied that the target port/service is willing to
+complete the connection, and so we consider the port open.
+
+In both modes, asmscan scans ports in parallel instead of serially. This gives
+it speeds that are comparable to that of nmap.
+
+==========[ 0x3 Todo ]
+- Allow user to specify a range of ports
+- Greater granularity of port state: notify the user if a port is open, closed,
+  filtered, or possibly something else.
