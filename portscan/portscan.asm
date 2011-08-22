@@ -27,6 +27,9 @@ section .data
         port_closed_msg         db ' closed', 10, 0
         wierd_syn_packet_msg    db 'Strange SYN packet recieved!', 10, 0
 
+        packet_delay_msg1:      db 'Latency: ', 0
+        packet_delay_msg2:      db ' ms', 10, 0
+
 ; ==============================================================================
 
 section .bss
@@ -324,7 +327,7 @@ ping_host:
         lea esi, [recvbuf + 16]
         mov edi, myaddr
         movsd
-        jmp ping_cleanup
+        jmp ping_print_result
                 
         ping_recv_failed:
         ; recvfrom(2) failed, print error message and exit
@@ -332,6 +335,27 @@ ping_host:
         push eax
         push dword recvfrom_error_msg
         call premature_exit
+        
+        ping_print_result:
+        ; Convert microseconds to milliseconds
+        mov eax, [timeout_master + 4]
+        mov ecx, 1000
+        div ecx
+
+        ; Convert this number to a string
+        push write_buffer
+        push eax
+        call ultostr
+        add esp, 8
+
+        ; "Delay time between packets: %d ms"
+        push packet_delay_msg1
+        call printstr
+        mov [esp], dword write_buffer
+        call printstr
+        mov [esp], dword packet_delay_msg2
+        call printstr
+        add esp, 4
 
         ping_cleanup:
         ; We're done with the socket
