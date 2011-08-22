@@ -3,15 +3,14 @@ Author: Eugene Ma
 
 ==========[ 0x0 Introduction ]
 
-        asmscan is a port scanner that applies both TCP and SYN scanning
-techniques to reveal open ports. It is written entirely in 32-bit x86 assembly,
-and uses only Linux system calls to interface with the operating system's
-network stack. Consequently, it is incompatible with other operating systems or
-microprocessor architectures. However, compared with other port scanner
-software, asmscan has the advantage of being completely libc free. In other
-words, it is never linked with an external library such as glibc. Furthermore,
-because asmscan is written in assembly, its binary is rather small at ten
-thousand bytes or so.
+        asmscan is a port scanner that implements both TCP and SYN scanning
+techniques. It is written entirely in 32-bit x86 assembly, and uses only Linux
+system calls to interface with the operating system's network stack.
+Consequently, it is incompatible with other operating systems or microprocessor
+architectures. However, compared with other port scanner software, asmscan has
+the advantage of being completely libc free. In other words, it is never linked
+with an external library such as glibc. Furthermore, because asmscan is written
+in assembly, its binary is rather small at ten thousand bytes or so.
 
 ==========[ 0x1 Installation ]
 
