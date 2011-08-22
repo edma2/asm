@@ -305,7 +305,7 @@ ping_host:
         mov eax, max_timeout
         mov ecx, [timeout_volatile + 4]
         sub eax, ecx
-        ; Extrapolate TCP connect time
+        ; Extrapolate the time it would take to send and recieve packets
         shl eax, 2
         mov [timeout_master + 4], eax   
 
@@ -340,6 +340,9 @@ ping_host:
         add esp, 4
         jmp syn_scan
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; non-root users start here
+
 ; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
 connect_scan:
         ; Scan ports 0-1023, last port always stored in ebx
@@ -350,7 +353,7 @@ connect_scan:
                 xor esi, esi 
                 ; Store nfds (= 1 + maximum fd) for sys_select
                 xor edi, edi 
-                gather_sockets:
+                connect_scan_gather_sockets:
                         ; Create socket with arguments
                         ; SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
                         push dword 6 
@@ -361,17 +364,17 @@ connect_scan:
                         ; Check return value
                         test eax, eax
                         ; sys_socket failed with -errno
-                        js socket_create_error 
-                        jmp save_socket
+                        js connect_scan_socket_error 
+                        jmp connect_scan_save_socket
 
-                        socket_create_error:
+                        connect_scan_socket_error:
                         ; We had trouble creating the socket
                         ; Save socket(2) errno on stack
                         push eax 
                         push socket_error_msg
                         call premature_exit
 
-                        save_socket:
+                        connect_scan_save_socket:
                         ; Socket seems good, save it to our array and map the port 
                         mov [live_sockets + 4 * esi], eax 
                         mov [live_ports + 2 * esi], word bx 
@@ -380,7 +383,7 @@ connect_scan:
                         cmp eax, edi
                         cmovg edi, eax
 
-                        attempt_connect:
+                        connect_scan_attempt_connect:
                         ; Initiate TCP handshake to port
                         ; Load port to sockaddr struct in htons() order
                         mov [sockaddr + 2], byte bh 
@@ -391,31 +394,30 @@ connect_scan:
                         call sys_connect
                         add esp, 12
 
-                        check_errno:
+                        connect_scan_check_connect_errno:
                         ; We expect to see EAGAIN or EINPROGRESS
                         cmp eax, EINPROGRESS
-                        je connect_in_progress
+                        je connect_scan_socket_in_progress
                         cmp eax, EAGAIN
-                        je connect_in_progress
+                        je connect_scan_socket_in_progress
                         cmp eax, 0
                         ; This would be very unexpected!
-                        je connect_complete
+                        je connect_scan_socket_complete
 
-                        wrong_errno:
                         ; Connect failed for reasons other than being "in progress"
                         ; Save connect(2) -errno on stack
                         push eax 
                         push connect_error_msg
                         call premature_exit
 
-                        connect_complete:
-                        connect_in_progress:
+                        connect_scan_socket_complete:
+                        connect_scan_socket_in_progress:
                         ; "Gather" next socket-port combination or proceed to next step
                         inc word bx
                         cmp esi, max_parallel_sockets
-                        jl gather_sockets
+                        jl connect_scan_gather_sockets
 
-                wait_for_connections:
+                connect_scan_sleep:
                 ; Copy timeout_master to timeout_volatile
                 lea esi, [timeout_master + 4]
                 lea edi, [timeout_volatile + 4]
@@ -429,6 +431,7 @@ connect_scan:
                 call sys_select
                 add esp, 20
 
+                connect_scan_monitor:
                 ; Copy masterfds to wrfds 
                 mov esi, masterfds
                 mov edi, wrfds
@@ -450,7 +453,7 @@ connect_scan:
                 cmp eax, 0
                 ; All sockets will block on write, skip to next iteration
                 je connect_scan_cleanup
-                jns check_for_connected_sockets 
+                jns connect_scan_check_for_connected_sockets 
 
                 ; We had some sort of trouble with select(2)
                 ; Save select(2) -errno on stack 
@@ -458,21 +461,21 @@ connect_scan:
                 push select_error_msg
                 call premature_exit
 
-                check_for_connected_sockets:
+                connect_scan_check_for_connected_sockets:
                 ; Check wrfds for our sockets
                 ; Reset index into socket array
                 xor esi, esi
-                iterate_through_fds:
-                        check_if_write_blocks:
+                connect_scan_iterate_through_fds:
+                        ; Check if write_blocks:
                         ; Fetch file descriptor
                         mov eax, [live_sockets + 4 * esi]
                         bt [wrfds], eax
 
                         ; This port didn't respond to our TCP request:
                         ; this means it was probably filtered
-                        jnc port_was_filtered 
+                        jnc connect_scan_port_was_filtered 
 
-                        send_empty_packet:
+                        connect_scan_send_empty_packet:
                         ; Seems like the socket can be written to
                         ; Let's try to send an empty dud packet to the host
                         push dword 0
@@ -483,9 +486,9 @@ connect_scan:
                         test eax, eax
                         ; We had trouble sending: 
                         ; the port was probably closed
-                        js port_was_closed
+                        js connect_scan_port_was_closed
                         
-                        connect_print_port:
+                        connect_scan_print_port:
                         ; We found an open port!
                         ; Convert the port number to a printable string
                         push port_open_msg
@@ -494,12 +497,12 @@ connect_scan:
                         call print_port
                         add esp, 4
 
-                        port_was_filtered:
-                        port_was_closed:
-                        check_next_socket:
+                        connect_scan_port_was_filtered:
+                        connect_scan_port_was_closed:
+                        connect_scan_check_next_socket:
                         inc esi
                         cmp esi, max_parallel_sockets
-                        jl iterate_through_fds
+                        jl connect_scan_iterate_through_fds
 
                 connect_scan_cleanup:
                 ; Kill all the sockets we opened 
@@ -508,6 +511,9 @@ connect_scan:
                 cmp bx, word 1024 
                 jl connect_scan_loop
                 jmp exit
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; root users start here
 
 syn_scan:
         ;;; Create raw socket with TCP protocol ;;;
@@ -556,7 +562,7 @@ syn_scan:
         ; Save the returned file descriptor
         mov [devrfd], eax
 
-        ;;; Send out all our SYN packets at once ;;;
+        ;;; Send out multiple SYN packets at once, then try to receieve them ;;;
 
         ; ebx = 0; ebx < high_port; ebx++
         xor ebx, ebx
