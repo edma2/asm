@@ -25,6 +25,8 @@ section .data
         ; sufficient and cheap enough for our purposes. (We don't want to
         ; exhaust our entropy pool!)
         devrpath:               db '/dev/urandom', 0
+        port_open_msg           db ' open', 10, 0
+        port_closed_msg         db ' closed', 10, 0
 
 ; ==============================================================================
 
@@ -451,7 +453,6 @@ connect_scan:
                 je connect_scan_cleanup
                 jns check_for_connected_sockets 
 
-                select_error:
                 ; We had some sort of trouble with select(2)
                 ; Save select(2) -errno on stack 
                 push eax
@@ -528,6 +529,7 @@ syn_scan:
         test eax, eax                   
         ; Give up immediately if we couldn't create a raw tcp socket
         js create_tcp_socket_failed
+
         ; Store the raw socket file descriptor in live_sockets array
         mov [live_sockets], eax             
         jmp setup_random_number_generator
@@ -552,7 +554,6 @@ syn_scan:
         ; Check return value 
         test eax, eax
         jns store_devrfd
-
         ; We were unable to open /dev/urandom
         ; Save open(2) -errno on stack
         push dword eax
@@ -568,33 +569,125 @@ syn_scan:
         ; ebx = current port 
         ; ebx will iterate through ports 0-1023
         xor ebx, ebx
-        send_syn_packet_loop:
+        syn_scan_loop:
+                syn_scan_send_syn:
                 push dword TH_SYN
                 push dword ebx
                 push dword [live_sockets]
                 call send_tcp_raw
                 add esp, 12
                         
-                cmp eax, EINPROGRESS   
-                je prepare_next_port
-                cmp eax, EAGAIN
-                je prepare_next_port
                 test eax, eax
-                jns prepare_next_port
-        
+                jns syn_scan_sleep
                 ; We had issues sending a SYN packet to the victim
                 ; Push sendto(2) -errno on stack
                 push eax
                 push dword sendto_error_msg
                 call premature_exit
 
-                prepare_next_port:
+                syn_scan_sleep:
+                ; Give some time for the packets to arrive
+                ; Copy timeout_master to timeout_volatile
+                lea esi, [timeout_master + 4]
+                lea edi, [timeout_volatile + 4]
+                movsd
+                push timeout_volatile
+                push dword 0
+                push dword 0
+                push dword 0
+                push dword 0
+                call sys_select
+                add esp, 20
+
+                syn_scan_monitor:
+                ; Monitor socket
+                mov esi, masterfds
+                mov edi, rdfds
+                mov ecx, masterfdslen
+                rep movsd
+                push timeout_zero
+                push dword 0
+                push dword 0
+                push dword rdfds
+                push dword [live_sockets]
+                inc dword [esp] 
+                call sys_select
+                add esp, 20
+
+                ; Check returned value of select in eax
+                cmp eax, 0
+                je syn_scan_next_port
+                jns syn_scan_recv_reply
+
+                ; Select failed with -errno in eax
+                push eax
+                push dword select_error_msg
+                call premature_exit
+                
+                syn_scan_recv_reply:
+                ; Read the socket for a response
+                mov [recvbuflen], dword 0xffff
+                push dword [live_sockets]
+                call recv_packet
+                add esp, 4
+
+                ; Check return value of recvfrom in eax
+                test eax, eax
+                jns syn_scan_examine_packet
+                push eax
+                push dword recvfrom_error_msg
+                call premature_exit
+        
+                syn_scan_examine_packet:
+                ; Get IP header length located in last 4 bits of first byte
+                movzx eax, byte [recvbuf]
+                and eax, 0xf
+                ; Convert from words to bytes
+                shl eax, 2
+                ; Point to flags section
+                add eax, 13
+                ; Bitwise separation of flags in the target byte
+                ; 0 | 0 | URG | ACK | PSH | RST | SYN | FIN
+                lea esi, [recvbuf + eax]
+                lodsb
+                ; ACK = 1, SYN = 1
+                cmp al, 0x12
+                je syn_scan_port_open
+                ; ACK = 1, RST = 1
+                cmp al, 0x14
+                je syn_scan_port_closed
+                jmp syn_scan_next_port
+                
+                syn_scan_port_open:
+                        push write_buffer
+                        push ebx
+                        call ultostr 
+                        add esp, 8
+                        push dword write_buffer 
+                        call printstr 
+                        mov [esp], dword port_open_msg
+                        call printstr
+                        add esp, 4
+                        jmp syn_scan_next_port
+                
+                syn_scan_port_closed:
+                        push write_buffer
+                        push ebx
+                        call ultostr 
+                        add esp, 8
+                        push dword write_buffer 
+                        call printstr 
+                        mov [esp], dword port_closed_msg
+                        call printstr
+                        add esp, 4
+                
+                syn_scan_next_port:
                 ; Everything seems normal, send a packet to the next port
                 inc ebx
                 cmp ebx, 1024
-                jne send_syn_packet_loop
-
-        ; Close file descriptor mapped to /dev/urandom 
+                jl syn_scan_loop
+        
+        syn_scan_done:
         push dword [devrfd]
         call sys_close
         add esp, 4
@@ -1077,16 +1170,16 @@ premature_exit:
         push dword [ebp + 8]
         call printstr
         add esp, 4
-        
-        ; Close file descriptor mapped to /dev/urandom if open
-        cmp [devrfd], dword 0
-        je clean_up_sockets
+
+        ; Close file descriptor mapped to /dev/urandom 
+        cmp dword [devrfd], 0
+        jz premature_exit_close_sockets
         push dword [devrfd]
         call sys_close
         add esp, 4
         
         ; Free all open sockets (raw, icmp, tcp, etc...)
-        clean_up_sockets:
+        premature_exit_close_sockets:
         call free_all_sockets
 
         ; Convert -errno to errno
@@ -1325,25 +1418,6 @@ sys_recvfrom:
         pop ebp
         ret
 ; ------------------------------------------------------------------------------
-; ------------------------------------------------------------------------------
-; sys_setsockopt
-;       Set socket options
-;               Expects: socket, level, option_name, option_value, option_len
-sys_setsockopt:
-        push ebp
-        mov ebp, esp
-        push ebx
-        
-        mov eax, 102
-        mov ebx, 14
-        lea ecx, [ebp + 8]
-        int 0x80
-
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret
-; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
 ; send_packet
@@ -1422,16 +1496,6 @@ rand:
         pop esi
         mov esp, ebp
         pop ebp
-        ret
-; ------------------------------------------------------------------------------
-
-; ------------------------------------------------------------------------------
-; send_tcp_raw_syn
-;       Send a raw SYN packet to target host
-;               Expects: stack - nothing
-;                        sockaddr - points to target host
-;               Returns: 0 on success, -1 on error
-send_tcp_raw_syn:
         ret
 ; ------------------------------------------------------------------------------
 ; EOF ==========================================================================
