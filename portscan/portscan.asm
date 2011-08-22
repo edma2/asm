@@ -680,7 +680,6 @@ syn_scan:
                         lea esi, [recvbuf + eax]
                         lodsb
                         ; Filter for the flags we're interested in (ACK and SYN)
-                        ; Make a new copy n cl first, because we clobber al
                         ; ACK = 1, SYN = 1
                         and al, 0x12
                         cmp al, 0x12
