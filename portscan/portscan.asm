@@ -516,32 +516,8 @@ connect_scan:
 ; root users start here
 
 syn_scan:
-        ;;; Create raw socket with TCP protocol ;;;
-        ; SOCK_RAW|NON_BLOCK, IPPROTO_TCP
-        push dword 6
-        push dword (3|4000q)
-        call spawn_socket
-        add esp, 8
-        
-        ; Check return value
-        test eax, eax                   
-        ; Give up immediately if we couldn't create a raw tcp socket
-        js create_tcp_socket_failed
-
-        ; Store the raw socket file descriptor in live_sockets array
-        mov [live_sockets], eax             
-        jmp setup_random_number_generator
-
-        create_tcp_socket_failed:
-        ; We had trouble creating the socket, print error message and exit
-        ; Save socket(2) -errno on stack
-        push eax 
-        push socket_error_msg
-        call premature_exit
-
         ;;; Set up pseudo-random number generator ;;;
 
-        setup_random_number_generator:
         ; O_RDONLY
         push dword 0
         ; "/dev/urandom"
@@ -567,8 +543,31 @@ syn_scan:
         ; ebx = 0; ebx < high_port; ebx++
         xor ebx, ebx
         syn_scan_loop:
+                ;;; Create raw socket with TCP protocol ;;;
+                ; SOCK_RAW|NON_BLOCK, IPPROTO_TCP
+                push dword 6
+                push dword (3|4000q)
+                call spawn_socket
+                add esp, 8
+                
+                ; Check return value
+                test eax, eax                   
+                ; Give up immediately if we couldn't create a raw tcp socket
+                js syn_scan_socket_failed
+
                 ; esi = 0; esi < maximum_parallel_ports; esi++
                 xor esi, esi
+                ; Store the highest numbered socket in live_sockets
+                mov [live_sockets], eax
+                jmp syn_scan_send_syn_loop
+
+                syn_scan_socket_failed:
+                ; We had trouble creating the socket, print error message and exit
+                ; Save socket(2) -errno on stack
+                push eax 
+                push socket_error_msg
+                call premature_exit
+                
                 syn_scan_send_syn_loop:
                         push dword TH_SYN
                         push dword ebx
@@ -681,7 +680,7 @@ syn_scan:
                         jmp syn_scan_recv_reply_loop
                 
                 syn_scan_next_batch:
-                ; Everything seems normal, send a packet to the next port
+                call free_all_sockets
                 cmp ebx, 1024
                 jl syn_scan_loop
         
@@ -689,7 +688,6 @@ syn_scan:
         push dword [devrfd]
         call sys_close
         add esp, 4
-        call free_all_sockets
 
 exit:
         mov ebp, esp
