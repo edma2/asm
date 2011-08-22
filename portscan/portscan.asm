@@ -562,7 +562,7 @@ syn_scan:
         xor ebx, ebx
         syn_scan_loop:
                 ; esi = 0; esi < maximum_parallel_ports; esi++
-                ;xor esi, esi
+                xor esi, esi
                 syn_scan_send_syn_loop:
                         push dword TH_SYN
                         push dword ebx
@@ -571,15 +571,18 @@ syn_scan:
                         add esp, 12
                                 
                         test eax, eax
-                        jns syn_scan_sleep
+                        jns syn_scan_send_next_syn
                         ; We had issues sending a SYN packet to the victim
                         ; Push sendto(2) -errno on stack
                         push eax
                         push dword sendto_error_msg
                         call premature_exit
 
-                        ;cmp esi, max_parallel_sockets
-                        ;jl syn_scan_send_syn_loop
+                        syn_scan_send_next_syn:
+                        inc esi
+                        inc ebx
+                        cmp esi, max_parallel_sockets
+                        jl syn_scan_send_syn_loop
 
                 syn_scan_sleep:
                 ; Give some time for the packets to arrive
@@ -612,67 +615,67 @@ syn_scan:
 
                 ; Check returned value of select in eax
                 cmp eax, 0
-                je syn_scan_next_port
-                jns syn_scan_recv_reply
+                je syn_scan_next_batch
+                jns syn_scan_recv_reply_loop
 
                 ; Select failed with -errno in eax
                 push eax
                 push dword select_error_msg
                 call premature_exit
                 
-                syn_scan_recv_reply:
-                ; Read the socket for a response
-                mov [recvbuflen], dword 0xffff
-                push dword [live_sockets]
-                call recv_packet
-                add esp, 4
+                syn_scan_recv_reply_loop:
+                        ; Read the socket for a response
+                        mov [recvbuflen], dword 0xffff
+                        push dword [live_sockets]
+                        call recv_packet
+                        add esp, 4
 
-                ; Check return value of recvfrom in eax
-                test eax, eax
-                jns syn_scan_examine_packet
-                push eax
-                push dword recvfrom_error_msg
-                call premature_exit
-        
-                syn_scan_examine_packet:
-                ; Get IP header length located in last 4 bits of first byte
-                movzx eax, byte [recvbuf]
-                and eax, 0xf
-                ; Convert from words to bytes
-                shl eax, 2
-                ; Store the address of TCP header start in edi
-                mov edi, eax
-                ; Point to flags field
-                add eax, 13
-                ; Bitwise separation of flags in the target byte:
-                ; 0 | 0 | URG | ACK | PSH | RST | SYN | FIN
-                lea esi, [recvbuf + eax]
-                lodsb
-                ; Filter for the flags we're interested in (ACK and SYN)
-                ; Make a new copy n cl first, because we clobber al
-                ; ACK = 1, SYN = 1
-                and al, 0x12
-                cmp al, 0x12
-                je syn_scan_port_open
-        
-                ; The port is considered closed, otherwise
-                push dword port_closed_msg
-                jmp syn_scan_print_port
-
-                syn_scan_port_open:
-                push dword port_open_msg
-
-                syn_scan_print_port:
-                ; Extract the port from the TCP header
-                movzx eax, word [recvbuf + edi]
-                xchg al, ah
-                push eax
-                call print_port
-                add esp, 8
+                        ; Check return value of recvfrom in eax
+                        cmp eax, 0
+                        ; If signed, then we were unable to read any more data
+                        jl syn_scan_next_batch
                 
-                syn_scan_next_port:
+                        syn_scan_examine_packet:
+                        ; Get IP header length located in last 4 bits of first byte
+                        movzx eax, byte [recvbuf]
+                        and eax, 0xf
+                        ; Convert from words to bytes
+                        shl eax, 2
+                        ; Store the address of TCP header start in edi
+                        mov edi, eax
+                        ; Point to flags field
+                        add eax, 13
+                        ; Bitwise separation of flags in the target byte:
+                        ; 0 | 0 | URG | ACK | PSH | RST | SYN | FIN
+                        lea esi, [recvbuf + eax]
+                        lodsb
+                        ; Filter for the flags we're interested in (ACK and SYN)
+                        ; Make a new copy n cl first, because we clobber al
+                        ; ACK = 1, SYN = 1
+                        and al, 0x12
+                        cmp al, 0x12
+                        je syn_scan_port_open
+                        jmp syn_scan_recv_reply_loop
+                
+                        ; The port is considered closed, otherwise
+                        push dword port_closed_msg
+                        jmp syn_scan_print_port
+
+                        syn_scan_port_open:
+                        push dword port_open_msg
+
+                        syn_scan_print_port:
+                        ; Extract the port from the TCP header
+                        movzx eax, word [recvbuf + edi]
+                        xchg al, ah
+                        push eax
+                        call print_port
+                        add esp, 8
+                        ; Keep receiving packets until we're unable to
+                        jmp syn_scan_recv_reply_loop
+                
+                syn_scan_next_batch:
                 ; Everything seems normal, send a packet to the next port
-                inc ebx
                 cmp ebx, 1024
                 jl syn_scan_loop
         
