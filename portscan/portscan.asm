@@ -16,8 +16,6 @@ section .data
         sendto_error_msg:       db 'Error: sys_sendto failed', 10, 0
         recvfrom_error_msg:     db 'Error: sys_recvfrom failed', 10, 0
         usage_msg:              db 'Usage: portscan <target ip>', 10, 0
-        ; For printing newlines after we print a number or something
-        newline_msg:            db 10, 0
         ; recvfrom(2) wants us to provide it with the ADDRESS of the length of
         ; the sockaddr, for some wierd reason.
         sockaddrlen_addr:       dd sockaddrlen
@@ -27,6 +25,7 @@ section .data
         devrpath:               db '/dev/urandom', 0
         port_open_msg           db ' open', 10, 0
         port_closed_msg         db ' closed', 10, 0
+        wierd_syn_packet_msg    db 'Strange SYN packet recieved!', 10, 0
 
 ; ==============================================================================
 
@@ -486,21 +485,14 @@ connect_scan:
                         ; the port was probably closed
                         js port_was_closed
                         
-                        print_port:
+                        connect_print_port:
                         ; We found an open port!
                         ; Convert the port number to a printable string
-                        movzx edx, word [live_ports + 2 * esi]
-                        push write_buffer
-                        push edx
-                        call ultostr 
-                        add esp, 8
-                        push dword write_buffer 
-                        call printstr 
-                        ; Print new line after port
-                        mov [esp], dword newline_msg
-                        call printstr
+                        push port_open_msg
+                        movzx eax, word [live_ports + 2 * esi]
+                        push eax
+                        call print_port
                         add esp, 4
-                        jmp check_next_socket
 
                         port_was_filtered:
                         port_was_closed:
@@ -566,24 +558,28 @@ syn_scan:
 
         ;;; Send out all our SYN packets at once ;;;
 
-        ; ebx = current port 
-        ; ebx will iterate through ports 0-1023
+        ; ebx = 0; ebx < high_port; ebx++
         xor ebx, ebx
         syn_scan_loop:
-                syn_scan_send_syn:
-                push dword TH_SYN
-                push dword ebx
-                push dword [live_sockets]
-                call send_tcp_raw
-                add esp, 12
-                        
-                test eax, eax
-                jns syn_scan_sleep
-                ; We had issues sending a SYN packet to the victim
-                ; Push sendto(2) -errno on stack
-                push eax
-                push dword sendto_error_msg
-                call premature_exit
+                ; esi = 0; esi < maximum_parallel_ports; esi++
+                ;xor esi, esi
+                syn_scan_send_syn_loop:
+                        push dword TH_SYN
+                        push dword ebx
+                        push dword [live_sockets]
+                        call send_tcp_raw
+                        add esp, 12
+                                
+                        test eax, eax
+                        jns syn_scan_sleep
+                        ; We had issues sending a SYN packet to the victim
+                        ; Push sendto(2) -errno on stack
+                        push eax
+                        push dword sendto_error_msg
+                        call premature_exit
+
+                        ;cmp esi, max_parallel_sockets
+                        ;jl syn_scan_send_syn_loop
 
                 syn_scan_sleep:
                 ; Give some time for the packets to arrive
@@ -644,42 +640,35 @@ syn_scan:
                 and eax, 0xf
                 ; Convert from words to bytes
                 shl eax, 2
-                ; Point to flags section
+                ; Store the address of TCP header start in edi
+                mov edi, eax
+                ; Point to flags field
                 add eax, 13
-                ; Bitwise separation of flags in the target byte
+                ; Bitwise separation of flags in the target byte:
                 ; 0 | 0 | URG | ACK | PSH | RST | SYN | FIN
                 lea esi, [recvbuf + eax]
                 lodsb
+                ; Filter for the flags we're interested in (ACK and SYN)
+                ; Make a new copy n cl first, because we clobber al
                 ; ACK = 1, SYN = 1
+                and al, 0x12
                 cmp al, 0x12
                 je syn_scan_port_open
-                ; ACK = 1, RST = 1
-                cmp al, 0x14
-                je syn_scan_port_closed
-                jmp syn_scan_next_port
-                
+        
+                ; The port is considered closed, otherwise
+                push dword port_closed_msg
+                jmp syn_scan_print_port
+
                 syn_scan_port_open:
-                        push write_buffer
-                        push ebx
-                        call ultostr 
-                        add esp, 8
-                        push dword write_buffer 
-                        call printstr 
-                        mov [esp], dword port_open_msg
-                        call printstr
-                        add esp, 4
-                        jmp syn_scan_next_port
-                
-                syn_scan_port_closed:
-                        push write_buffer
-                        push ebx
-                        call ultostr 
-                        add esp, 8
-                        push dword write_buffer 
-                        call printstr 
-                        mov [esp], dword port_closed_msg
-                        call printstr
-                        add esp, 4
+                push dword port_open_msg
+
+                syn_scan_print_port:
+                ; Extract the port from the TCP header
+                movzx eax, word [recvbuf + edi]
+                xchg al, ah
+                push eax
+                call print_port
+                add esp, 8
                 
                 syn_scan_next_port:
                 ; Everything seems normal, send a packet to the next port
@@ -1494,6 +1483,39 @@ rand:
         lodsd
 
         pop esi
+        mov esp, ebp
+        pop ebp
+        ret
+; ------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------
+; print_port
+;       Write to output telling the user if the port was open or closed.       
+;               Expects: port, open/closed message buffer
+;               Returns: nothing
+print_port:
+        push ebp
+        mov ebp, esp
+
+        ; Convert port number to string 
+        push write_buffer
+        push dword [ebp + 8]
+        call ultostr 
+        add esp, 8
+
+        ; Print port number
+        push dword write_buffer 
+        call printstr 
+
+        ; Swap buffers
+        ; Examples:
+        ; printf("%d is closed\n", port);
+        ; printf("%d is open\n", port);
+        mov eax, [ebp + 12]
+        mov [esp], eax
+        call printstr
+        add esp, 4
+
         mov esp, ebp
         pop ebp
         ret
