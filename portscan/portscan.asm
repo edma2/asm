@@ -704,7 +704,7 @@ syn_scan:
                         jmp syn_scan_recv_reply_loop
                 
                 syn_scan_next_batch:
-                ; Everything seems normal, send a packet to the next port
+                ; Everything seems normal, scan the next batch of ports
                 cmp ebx, 1024
                 jl syn_scan_loop
         
