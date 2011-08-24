@@ -79,7 +79,7 @@ section .bss
         tv_volatile:            resd 2                  
         ; This is always zero
         tv_zero:                resd 2                  
-        ; This is the default delay we use between sending packets
+        ; This is the delay between sending packets
         tv_master:              resd 2
 
         ; The global buffers we use to send and recieve datagrams
@@ -153,7 +153,7 @@ check_root:
         ; Root user has uid = 0
         call sys_getuid
         cmp eax, 0
-        je isr00t
+        je ping_host
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -185,7 +185,7 @@ tcp_scan_loop:
                 tcp_scan_store_socket:
                         mov [socketarray + 4 * esi], eax 
                         mov [portarray + 2 * esi], word bx 
-                        ; Update highest file descriptor
+                        ; Update highest numbered file descriptor
                         cmp eax, edi
                         cmovg edi, eax
 
@@ -199,26 +199,26 @@ tcp_scan_loop:
                         call sys_connect
                         add esp, 12
 
-                ; The errno returned should say in progress or try again
+                ; The errno should indicate connection in progress 
                 cmp eax, EINPROGRESS
-                je tcp_scan_next_socket
+                je tcp_scan_connect_loop_next
                 cmp eax, EAGAIN
-                je tcp_scan_next_socket
-                cmp eax, 0
-                je tcp_scan_next_socket
+                je tcp_scan_connect_loop_next
+                test eax, eax
+                jns tcp_scan_connect_loop_next
 
                 ; Otherwise, print connect error message and exit with errno
                 push eax 
                 push connect_error_msg
                 call premature_exit
 
-                ; Prepare next iteration or break loop
-                tcp_scan_next_socket:
-                ; Increment array index and port 
-                inc word bx
-                inc esi
-                cmp esi, max_parallel_sockets
-                jl tcp_scan_connect_loop
+        tcp_scan_connect_loop_next:
+        ; Prepare next iteration or break loop
+        ; Increment array index and port 
+        inc word bx
+        inc esi
+        cmp esi, max_parallel_sockets
+        jl tcp_scan_connect_loop
 
         ; Wait for requested connects to finish or timeout
         tcp_scan_sleep:
@@ -251,12 +251,12 @@ tcp_scan_loop:
 
         ; Reset array index
         xor esi, esi
-        ; Select returns the number of bits set in wrfds, or -errno if error
+        ; Select returns the number of bits set in wrfds
         cmp eax, 0
         je tcp_scan_cleanup
         jns tcp_scan_write_loop 
 
-        ; Print select error message and exit with errno
+        ; Otherwise, print select error message and exit with errno
         push eax
         push select_error_msg
         call premature_exit
@@ -283,8 +283,8 @@ tcp_scan_loop:
                 test eax, eax
                 js tcp_scan_port_closed
                 
-                ; The write succeeded, which means the TCP connection is active
-                connect_scan_print_port:
+                ; The write succeeded, implying the TCP connection is active
+                tcpt_scan_port_open:
                         ; Convert the port number to a printable string
                         push port_open_fmtstr
                         movzx eax, word [portarray + 2 * esi]
@@ -292,213 +292,198 @@ tcp_scan_loop:
                         call print_port
                         add esp, 4
 
-                tcp_scan_port_filtered:
-                tcp_scan_port_closed:
-                inc esi
-                cmp esi, max_parallel_sockets
-                jl tcp_scan_write_loop
+        tcp_scan_port_filtered:
+        tcp_scan_port_closed:
+        ; Try next socket
+        inc esi
+        cmp esi, max_parallel_sockets
+        jl tcp_scan_write_loop
 
-        tcp_scan_cleanup:
+tcp_scan_cleanup:
+        ; Clean up socket descriptors
         call free_all_sockets
+        ; Check if we scanned the last port
         cmp bx, word 1024 
         jl tcp_scan_loop
         jmp exit
 
-isr00t:
 ping_host:
-        ;;; Send an ICMP echo packet, and wait for an ICMP request packet ;;;
+        ; Create a raw socket with protocol IPPROTO_ICMP
+        ping_host_create_socket:
+                ; socket(PF_SET, (SOCK_RAW | O_NONBLOCK), IPPROTO_ICMP)
+                push dword 1                    
+                push dword (3 | 4000q)         
+                call spawn_socket                 
+                add esp, 8                  
 
-        create_icmp_socket:
-        ; To create a raw socket, user need root permissions
-        ; SOCK_RAW|O_NONBLOCK, IPPROTO_ICMP
-        push dword 1                    
-        push dword (3 | 4000q)         
-        call spawn_socket                 
-        add esp, 8                  
-
-        ; Check return value
+        ; Return value should be a socket descriptor
         test eax, eax                   
-        ; Give up immediately if we couldn't create an icmp socket
-        js create_icmp_socket_failed
-        ; Store the raw socket file descriptor in socket array
-        mov [socketarray], eax             
-        jmp build_icmp_packet
+        jns ping_host_store_socket
 
-        create_icmp_socket_failed:
-        ; We had trouble creating the socket, print error message and exit
-        ; Save socket(2) -errno on stack
+        ; Otherwise, print socket error message and exit with errno
         push eax 
         push socket_error_msg
         call premature_exit
 
-        build_icmp_packet:
-        ; Build an ICMP packet with message type 8 (Echo request). The kernel
-        ; will craft the IP header for us because IP_HDRINCL is disabled by
-        ; default, so we don't build the IP header.
-        mov edi, sendbuf            
-        ; Type: 8 (Echo request)
-        mov al, 8                     
-        stosb                           
-        ; Code: 0 (Cleared for this type)
-        xor al, al                      
-        stosb                          
-        ; Calculate ICMP checksum later
-        xor eax, eax                    
-        stosw                         
-        ; Identifier: 0, Sequence number: 0
-        stosd                           
-        ; Now we have to zero out 56 bytes of ICMP padding data
-        xor eax, eax                    
-        mov ecx, 14                    
-        rep stosd                       
-        ; Calculate ICMP checksum which includes ICMP header and data
-        push dword ((icmphdrlen+56)/2)
-        push dword sendbuf        
-        call cksum                     
-        add esp, 8                  
-        ; Store result in packet ICMP header
-        mov [sendbuf + 2], word ax   
-        ; Before sending/receiving packets, store the length after filling out
-        ; the packet.
-        mov [sendbuflen], dword (icmphdrlen + 56)
+        ; Store the returned socket descriptor 
+        ping_host_store_socket:
+                mov [socketarray], eax             
 
-        ;;; Send the packet thrice through the created ICMP socket ;;;
+        ; Build an ICMP packet with message type 8 (Echo request). The kernel
+        ; will craft the IP header.
+        ping_host_build_packet:
+                mov edi, sendbuf            
+                ; Type: 8 (Echo request)
+                mov al, 8                     
+                stosb                           
+                ; Code: 0 (Cleared for this type)
+                xor al, al                      
+                stosb                          
+                ; Calculate ICMP checksum later
+                xor eax, eax                    
+                stosw                         
+                ; Identifier: 0, Sequence number: 0
+                stosd                           
+                ; Now we have to zero out 56 bytes of ICMP padding data
+                xor eax, eax                    
+                mov ecx, 14                    
+                rep stosd                       
+                ; Calculate ICMP checksum which includes ICMP header and data
+                push dword ((icmphdrlen+56)/2)
+                push dword sendbuf        
+                call cksum                     
+                add esp, 8                  
+                ; Store result in packet ICMP header
+                mov [sendbuf + 2], word ax   
+                ; Store the length of the packet we wish to send
+                mov [sendbuflen], dword (icmphdrlen + 56)
 
         mov ebx, 3                             
-        ; Socket is in non-blocking mode, so we send and receieve data
-        ; asynchronously. In this case, send 3 pings and block until socket has
-        ; data ready to be read.
-        send_ping_requests:
+        ; The socket is in non-blocking mode, so sending and receiving data
+        ; occurs asynchronously. Send 3 pings and block until socket has data
+        ; ready to be read.
+        ping_host_send_packets:
                 push dword [socketarray]
                 call send_packet
                 add esp, 4
+
+                ; The errno should indicate connection in progress 
                 cmp eax, EINPROGRESS   
-                je .next
+                je ping_host_send_next_packet
                 cmp eax, EAGAIN
-                je .next
+                je ping_host_send_next_packet
                 test eax, eax
-                js ping_send_failed
-                .next:
-                dec ebx
-                jnz send_ping_requests
-                jmp calculate_delay
+                jns ping_host_send_next_packet
 
-        ping_send_failed:
-        ; We had trouble sending data to host, print error message and exit
-        ; Save sendto(2) -errno on stack
-        push eax
-        push sendto_error_msg
-        call premature_exit
+                ; Otherwise, print sendto error message and exit with errno
+                push eax
+                push sendto_error_msg
+                call premature_exit
 
-        calculate_delay:
-        ;;; Check how long it takes to get our first ICMP Echo reply ;;;
+        ping_host_send_next_packet:
+        ; Check if we've sent three packets
+        dec ebx
+        jnz ping_host_send_packets
 
-        ; Timeout is an upper bound on how long to wait before select(2)
-        ; returns. Linux will adjust the timeval struct to reflect the time
-        ; remaining. Furthermore, we only care about the first reply we get,
-        ; and ignore the rest.
+        ; Time how long it takes to receieve the first ICMP echo response
+        ping_host_time_response:
+                ; Initialize tv_usec to maximum timeout 
+                mov edi, tv_volatile
+                xor eax, eax
+                stosd
+                mov eax, max_timeout
+                stosd
 
-        ; Initialize tv_usec to maximum timeout 
-        mov edi, tv_volatile
-        xor eax, eax
-        stosd
-        mov eax, max_timeout
-        stosd
+                ; Copy masterfds to rdfds
+                mov esi, masterfds
+                mov edi, rdfds
+                mov ecx, masterfdslen
+                rep movsd
 
-        ; Copy masterfds to rdfds
-        mov esi, masterfds
-        mov edi, rdfds
-        mov ecx, masterfdslen
-        rep movsd
-        ; Block until data is ready to be read, or we exceed timeout
-        push tv_volatile       
-        push dword 0                    
-        push dword 0                   
-        push rdfds                  
-        push dword [socketarray]
-        inc dword [esp]
-        call sys_select                 
-        add esp, 20
+                ; Block until data is ready to be read, or timeout exceeded 
+                push tv_volatile       
+                push dword 0                    
+                push dword 0                   
+                push rdfds                  
+                push dword [socketarray]
+                inc dword [esp]
+                call sys_select                 
+                add esp, 20
                 
-        ; Check return value
+        ; Select returns the number of bits set in rdfds
         cmp eax, 0
-        js ping_select_failed
-        jz ping_no_reply
-        jmp ping_get_reply
+        je ping_host_no_reply
+        jns ping_host_replied
 
-        ping_select_failed:
-        ; Something went wrong with select(2), print error message and exit
-        ; Save select(2) errno on stack
+        ; Otherwise, print select error message and exit with errno
         push eax
         push dword select_error_msg
         call premature_exit
 
-        ping_no_reply:
-        ; We didn't get a reply from victim, use default timeout instead
-        push dword [socketarray]
-        call free_socket
-        add esp, 4
-        mov [tv_master + 4], dword max_timeout
-        jmp ping_cleanup
-        
-        ;;; Receieve data and calculate packet delay ;;;
+        ping_host_no_reply:
+                ; Victim didn't respond to our ping, so use the default timeout
+                push dword [socketarray]
+                call free_socket
+                add esp, 4
+                mov [tv_master + 4], dword max_timeout
+                jmp ping_host_cleanup
 
-        ping_get_reply:
-        ; First we should calculate the packet delay in tv_volatile
-        mov eax, max_timeout
-        mov ecx, [tv_volatile + 4]
-        sub eax, ecx
-        ; Extrapolate the time it would take to send and recieve packets
-        shl eax, 2
-        mov [tv_master + 4], eax   
+        ping_host_replied:
+                ; Calculate the packet delay from max_timeout - remaining time
+                mov eax, max_timeout
+                mov ecx, [tv_volatile + 4]
+                sub eax, ecx
 
-        ; Data will be stored in recvbuf
-        ; Set number of bytes we expect to receive in packet
-        mov [recvbuflen], dword (iphdrlen+icmphdrlen+56)
-        push dword [socketarray]
-        call recv_packet
-        add esp, 4
-        
-        ; Check return value
-        test eax, eax
-        js ping_recv_failed
-        ; Swipe the IP address from the ICMP packet we recieved 
-        ; This should get the destination address field of the IP header
-        lea esi, [recvbuf + 16]
-        mov edi, myaddr
-        movsd
-        jmp ping_print_result
+                ; Extrapolate the time it would take to send and recieve packets
+                shl eax, 2
+                mov [tv_master + 4], eax   
+
+                ; Read the socket for a response
+                mov [recvbuflen], dword 0xffff
+                push dword [socketarray]
+                call recv_packet
+                add esp, 4
                 
-        ping_recv_failed:
-        ; recvfrom(2) failed, print error message and exit
-        ; Save recvfrom(2) errno on stack
+        ; recvfrom should return the number of bytes received
+        test eax, eax
+        jns ping_host_save_address
+
+        ; Otherwise, print recvfrom error message and exit with errno
         push eax
         push dword recvfrom_error_msg
         call premature_exit
+
+        ; Swipe the IP address from the ICMP packet we recieved 
+        ping_host_save_address:
+                ; This should get the destination address field of the IP header
+                lea esi, [recvbuf + 16]
+                mov edi, myaddr
+                movsd
         
-        ping_print_result:
-        ; Convert microseconds to milliseconds
-        mov eax, [tv_master + 4]
-        mov ecx, 1000
-        div ecx
+        ; Print expected latency (mostly useful for debugging)
+        ping_host_print_result:
+                ; Convert microseconds to milliseconds
+                mov eax, [tv_master + 4]
+                mov ecx, 1000
+                div ecx
 
-        ; Convert this number to a string
-        push writebuf
-        push eax
-        call ultostr
-        add esp, 8
+                ; Convert this number to a string
+                push writebuf
+                push eax
+                call ultostr
+                add esp, 8
 
-        ; "Latency: %d ms"
-        push latency_fmtstr1
-        call printstr
-        mov [esp], dword writebuf
-        call printstr
-        mov [esp], dword latency_fmtstr2
-        call printstr
-        add esp, 4
+                ; "Latency: %d ms"
+                push latency_fmtstr1
+                call printstr
+                mov [esp], dword writebuf
+                call printstr
+                mov [esp], dword latency_fmtstr2
+                call printstr
+                add esp, 4
 
-        ping_cleanup:
-        ; We're done with the socket
+ping_host_cleanup:
+        ; Close socket descriptor
         push dword [socketarray]
         call free_socket
         add esp, 4
@@ -775,7 +760,6 @@ send_tcp_raw:
         mov esp, ebp
         pop ebp
         ret
-
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
