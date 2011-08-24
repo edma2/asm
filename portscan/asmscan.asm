@@ -114,7 +114,6 @@ check_argc:
         ; Make sure we were invoked with one argument
         cmp [ebp], dword 2
         je parse_argv
-
         ; Print usage string and exit with exit code 1
         push dword -1 
         push dword usage_msg
@@ -126,11 +125,9 @@ parse_argv:
         push dword [ebp + 8]           
         call parse_octets             
         add esp, 8                   
-
         ; Check return value
         test eax, eax      
         jns load_sockaddr           
-
         ; Complain about malformed ip and exit with exit code 1
         push dword -1
         push dword parse_error_msg            
@@ -171,16 +168,13 @@ tcp_scan_loop:
                         push dword (1 | 4000q) 
                         call spawn_socket
                         add esp, 8
-
                 ; Return value should be a socket descriptor
                 test eax, eax
                 jns tcp_scan_store_socket
-
                 ; Otherwise, print socket error message and exit with errno
                 push eax 
                 push socket_error_msg
                 call premature_exit
-
                 ; Save socket to array and map it to the port 
                 tcp_scan_store_socket:
                         mov [socketarray + 4 * esi], eax 
@@ -188,7 +182,6 @@ tcp_scan_loop:
                         ; Update highest numbered file descriptor
                         cmp eax, edi
                         cmovg edi, eax
-
                 ; Load sockaddr with port in network byte order 
                 tcp_scan_connect:
                         mov [sockaddr + 2], byte bh 
@@ -198,7 +191,6 @@ tcp_scan_loop:
                         push eax 
                         call sys_connect
                         add esp, 12
-
                 ; The errno should indicate connection in progress 
                 cmp eax, EINPROGRESS
                 je tcp_scan_connect_loop_next
@@ -206,7 +198,6 @@ tcp_scan_loop:
                 je tcp_scan_connect_loop_next
                 test eax, eax
                 jns tcp_scan_connect_loop_next
-
                 ; Otherwise, print connect error message and exit with errno
                 push eax 
                 push connect_error_msg
@@ -217,7 +208,6 @@ tcp_scan_loop:
         inc esi
         cmp esi, max_parallel_sockets
         jl tcp_scan_connect_loop
-
         ; Wait for requested connects to finish or timeout
         tcp_scan_sleep:
                 ; Copy default timeout to tv_volatile
@@ -229,7 +219,6 @@ tcp_scan_loop:
                 push dword 0
                 call sys_select
                 add esp, 20
-
         ; Monitor sockets with select
         tcp_scan_select:
                 ; Update wrfds with socket descriptors of living sockets
@@ -246,19 +235,16 @@ tcp_scan_loop:
                 push edi
                 call sys_select
                 add esp, 20
-
         ; Reset array index
         xor esi, esi
         ; Select returns the number of bits set in wrfds
         cmp eax, 0
         je tcp_scan_cleanup
         jns tcp_scan_write_loop 
-
         ; Otherwise, print select error message and exit with errno
         push eax
         push select_error_msg
         call premature_exit
-
         ; Traverse array and write to sockets set in wrfds 
         tcp_scan_write_loop:
                 ; If the bit mapped to the socket is cleared, the socket is not
@@ -268,7 +254,6 @@ tcp_scan_loop:
                 mov eax, [socketarray + 4 * esi]
                 bt [wrfds], eax
                 jnc tcp_scan_port_filtered 
-
                 ; Otherwise, try writing 0 bytes to the socket
                 tcp_scan_write:
                         push dword 0
@@ -276,11 +261,9 @@ tcp_scan_loop:
                         push eax
                         call sys_write
                         add esp, 12 
-
                 ; Write should return number of bytes written, or -errno
                 test eax, eax
                 js tcp_scan_port_closed
-                
                 ; The write succeeded, implying the TCP connection is active
                 tcpt_scan_port_open:
                         ; Convert the port number to a printable string
@@ -312,20 +295,16 @@ ping_host:
                 push dword (3 | 4000q)         
                 call spawn_socket                 
                 add esp, 8                  
-
         ; Return value should be a socket descriptor
         test eax, eax                   
         jns ping_host_store_socket
-
         ; Otherwise, print socket error message and exit with errno
         push eax 
         push socket_error_msg
         call premature_exit
-
         ; Store the returned socket descriptor 
         ping_host_store_socket:
                 mov [socketarray], eax             
-
         ; Build an ICMP packet with message type 8 (Echo request). The kernel
         ; will craft the IP header.
         ping_host_build_packet:
@@ -354,16 +333,14 @@ ping_host:
                 mov [sendbuf + 2], word ax   
                 ; Store the length of the packet we wish to send
                 mov [sendbuflen], dword (icmphdrlen + 56)
-
-        mov ebx, 3                             
         ; The socket is in non-blocking mode, so sending and receiving data
         ; occurs asynchronously. Send 3 pings and block until socket has data
         ; ready to be read.
+        mov ebx, 3                             
         ping_host_send_packets:
                 push dword [socketarray]
                 call send_packet
                 add esp, 4
-
                 ; The errno should indicate connection in progress 
                 cmp eax, EINPROGRESS   
                 je ping_host_send_next_packet
@@ -371,7 +348,6 @@ ping_host:
                 je ping_host_send_next_packet
                 test eax, eax
                 jns ping_host_send_next_packet
-
                 ; Otherwise, print sendto error message and exit with errno
                 push eax
                 push sendto_error_msg
@@ -380,7 +356,6 @@ ping_host:
         ping_host_send_next_packet:
         dec ebx
         jnz ping_host_send_packets
-
         ; Time how long it takes to receieve the first ICMP echo response
         ping_host_time_response:
                 ; Initialize tv_usec to maximum timeout 
@@ -389,13 +364,11 @@ ping_host:
                 stosd
                 mov eax, max_timeout
                 stosd
-
                 ; Copy masterfds to rdfds
                 mov esi, masterfds
                 mov edi, rdfds
                 mov ecx, masterfdslen
                 rep movsd
-
                 ; Block until data is ready to be read, or timeout exceeded 
                 push tv_volatile       
                 push dword 0                    
@@ -405,70 +378,59 @@ ping_host:
                 inc dword [esp]
                 call sys_select                 
                 add esp, 20
-                
         ; Select returns the number of bits set in rdfds
         cmp eax, 0
         je ping_host_no_reply
         jns ping_host_replied
-
         ; Otherwise, print select error message and exit with errno
         push eax
         push dword select_error_msg
         call premature_exit
-
+        ; Victim didn't respond to our ping, so use the default timeout
         ping_host_no_reply:
-                ; Victim didn't respond to our ping, so use the default timeout
                 push dword [socketarray]
                 call free_socket
                 add esp, 4
                 mov [tv_master + 4], dword max_timeout
                 jmp ping_host_cleanup
-
+        ; Calculate timeout and receive packet data
         ping_host_replied:
                 ; Calculate the packet delay from max_timeout - remaining time
                 mov eax, max_timeout
                 mov ecx, [tv_volatile + 4]
                 sub eax, ecx
-
                 ; RTT * 4 
                 shl eax, 2
                 mov [tv_master + 4], eax   
-
                 ; Read the socket for a response
                 mov [recvbuflen], dword 0xffff
                 push dword [socketarray]
                 call recv_packet
                 add esp, 4
-                
         ; recvfrom should return the number of bytes received
         test eax, eax
         jns ping_host_save_address
-
         ; Otherwise, print recvfrom error message and exit with errno
         push eax
         push dword recvfrom_error_msg
         call premature_exit
-
         ; Swipe the IP address from the ICMP packet we recieved 
         ping_host_save_address:
                 ; This should get the destination address field of the IP header
                 lea esi, [recvbuf + 16]
                 mov edi, myaddr
                 movsd
-        
         ; Print expected latency (mostly useful for debugging)
         ping_host_print_result:
                 ; Convert microseconds to milliseconds
                 mov eax, [tv_master + 4]
                 mov ecx, 1000
                 div ecx
-
                 ; Convert this number to a string
                 push writebuf
                 push eax
                 call ultostr
                 add esp, 8
-
                 ; "Latency: %d ms"
                 push latency_fmtstr1
                 call printstr
@@ -485,26 +447,22 @@ ping_host_cleanup:
         add esp, 4
 
 syn_scan:
+        ; socket(PF_INET, (SOCK_RAW | NON_BLOCK), IPPROTO_TCP)
         syn_scan_create_socket:
-                ; socket(PF_INET, (SOCK_RAW | NON_BLOCK), IPPROTO_TCP)
                 push dword 6
                 push dword (3|4000q)
                 call spawn_socket
                 add esp, 8
-        
         ; Return value should be a socket descriptor
         test eax, eax                   
         jns syn_scan_store_socket
-
         ; Otherwise, print socket error message and exit with errno
         push eax 
         push socket_error_msg
         call premature_exit
-
         ; Store the raw socket file descriptor in socketarray array
         syn_scan_store_socket:
                 mov [socketarray], eax             
-
         ; Set up random number generator device for generating SYN sequences
         syn_scan_setup_random:
                 ; O_RDONLY
@@ -513,20 +471,16 @@ syn_scan:
                 push dword devrpath
                 call sys_open
                 add esp, 8
-        
         ; Check return value for a valid file descriptor
         test eax, eax
         jns syn_scan_store_random
-
         ; Otherwise, print open error message and exit with errno
         push dword eax
         push dword open_error_msg
         call premature_exit
-
         ; Save the returned file descriptor
         syn_scan_store_random:
                 mov [devrfd], eax
-
         ; ebx = 0; ebx < high_port; ebx++
         xor ebx, ebx
         syn_scan_loop:
@@ -540,11 +494,9 @@ syn_scan:
                                 push dword [socketarray]
                                 call send_tcp_raw
                                 add esp, 12
-                                
                         ; Return value should be number of bytes sent
                         test eax, eax
                         jns syn_scan_send_next
-
                         ; Else, print sendto error message and exit with errno
                         push eax
                         push dword sendto_error_msg
@@ -555,7 +507,6 @@ syn_scan:
                 inc ebx
                 cmp esi, max_parallel_sockets
                 jl syn_scan_send_syn_loop
-
                 ; Give some time for the packets to arrive
                 syn_scan_sleep:
                         ; Copy tv_master to tv_volatile
@@ -569,7 +520,6 @@ syn_scan:
                         push dword 0
                         call sys_select
                         add esp, 20
-
                 ; Monitor socket
                 syn_scan_monitor:
                         mov esi, masterfds
@@ -584,17 +534,14 @@ syn_scan:
                         inc dword [esp] 
                         call sys_select
                         add esp, 20
-
                 ; Select returns the number of bits set in rdfds
                 cmp eax, 0
                 je syn_scan_next_batch
                 jns syn_scan_recv_reply_loop
-
                 ; Otherwise, print select error message and exit with errno
                 push eax
                 push dword select_error_msg
                 call premature_exit
-                
                 ; Store the reply packet in recvbuf and look for flags
                 syn_scan_recv_reply_loop:
                         ; Read the socket for a response
@@ -603,12 +550,10 @@ syn_scan:
                                 push dword [socketarray]
                                 call recv_packet
                                 add esp, 4
-
                         ; recvfrom should return the number of bytes received
                         test eax, eax
                         ; If signed, then we were unable to read any more data
                         js syn_scan_next_batch
-                
                         ; Get IP header length located in last 4 bits
                         ; of first byte
                         movzx eax, byte [recvbuf]
@@ -629,9 +574,8 @@ syn_scan:
                         and al, 0x12
                         cmp al, 0x12
                         jne syn_scan_recv_reply_loop
-
+                        ; Print the port if flags ACK and SYN are on
                         syn_scan_port_open:
-                                ; Print the port if flags ACK and SYN are on
                                 push dword port_open_fmtstr
                                 ; Extract the port from the TCP header
                                 movzx eax, word [recvbuf + edi]
@@ -645,6 +589,7 @@ syn_scan:
         syn_scan_next_batch:
         cmp ebx, 1024
         jl syn_scan_loop
+
 ; Clean up file descriptors and exit
 syn_scan_cleanup:
         push dword [devrfd]
@@ -1147,7 +1092,6 @@ premature_exit:
         ; Exit and send errno to shell
         mov eax, 1
         int 0x80
-
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
@@ -1165,7 +1109,6 @@ sys_getuid:
         mov esp, ebp
         pop ebp
         ret
-
 ; ------------------------------------------------------------------------------
 
 ; ------------------------------------------------------------------------------
