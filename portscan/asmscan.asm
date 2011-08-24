@@ -641,12 +641,11 @@ syn_scan:
                                 add esp, 8
                 ; Keep receiving packets until we're unable to
                 jmp syn_scan_recv_reply_loop
-                
-        syn_scan_next_batch:
         ; Everything seems normal, scan the next batch of ports
+        syn_scan_next_batch:
         cmp ebx, 1024
         jl syn_scan_loop
-        
+; Clean up file descriptors and exit
 syn_scan_cleanup:
         push dword [devrfd]
         call sys_close
