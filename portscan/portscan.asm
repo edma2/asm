@@ -5,7 +5,7 @@
 ; ==============================================================================
 
 section .data
-        ; Error messages to call before exit
+        ; Error messages to call if we exit prematurely
         open_error_msg:         db 'Error: sys_open failed', 10, 0
         socket_error_msg:       db 'Error: sys_socket failed', 10, 0
         select_error_msg:       db 'Error: sys_select failed', 10, 0
@@ -16,8 +16,8 @@ section .data
         usage_msg:              db 'Usage: asmscan <target ip>', 10, 0
         
         ; Formatting strings: ex. printf("%d open", port)
-        port_open_fmtstr        db ' open', 10, 0
-        port_closed_fmtstr      db ' closed', 10, 0
+        port_open_fmtstr:       db ' open', 10, 0
+        port_closed_fmtstr:     db ' closed', 10, 0
 
         latency_fmtstr1:        db 'Latency: ', 0
         latency_fmtstr2:        db ' ms', 10, 0
@@ -32,7 +32,7 @@ section .data
 ; ==============================================================================
 
 section .bss
-        ; This struct needs to be filled in before using a sockets
+        ; This struct needs to be filled in before using sockets
         ; struct sockaddr_in {
         ;       short int          sin_family;  // Address family, AF_INET
         ;       unsigned short int sin_port;    // Port number
@@ -42,7 +42,7 @@ section .bss
         sockaddr:               resb (2+2+4+8)
         sockaddrlen             equ $-sockaddr
 
-        ; The bitmap used to track living sockets and passed to select 
+        ; The bitmap used to track living sockets and as select argument
         ; typedef struct {
         ;       unsigned long fds_bits [__FDSET_LONGS];
         ; } __kernel_fd_set;
@@ -1181,7 +1181,7 @@ premature_exit:
 
         ; Close file descriptor mapped to /dev/urandom 
         cmp dword [devrfd], 0
-        jz premature_exit_close_sockets
+        je premature_exit_close_sockets
         push dword [devrfd]
         call sys_close
         add esp, 4
