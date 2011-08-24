@@ -2,7 +2,9 @@
 ; Usage: asmscan <host>
 ; Author: Eugene Ma
 
-; ==============================================================================
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 section .data
         ; Error messages to call if we exit prematurely
@@ -15,21 +17,20 @@ section .data
         parse_error_msg:        db 'Error: malformed ip address', 10, 0
         usage_msg:              db 'Usage: asmscan <target ip>', 10, 0
         
-        ; Formatting strings: ex. printf("%d open", port)
+        ; printf("%d open", port)
         port_open_fmtstr:       db ' open', 10, 0
+        ; printf("%d closed", port)
         port_closed_fmtstr:     db ' closed', 10, 0
-
+        ; printf("Latency %d ms", time)
         latency_fmtstr1:        db 'Latency: ', 0
         latency_fmtstr2:        db ' ms', 10, 0
 
-        ; Pointer to length of socket address 
-        sockaddrlen_addr:       dd sockaddrlen
-
-        ; The (pseudo-)random number generator we will use; urandom(4) is
-        ; sufficient and cheap 
+        ; Path to the random number generator device
         devrpath:               db '/dev/urandom', 0
 
-; ==============================================================================
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 section .bss
         ; This struct needs to be filled in before using sockets
@@ -41,6 +42,7 @@ section .bss
         ; };
         sockaddr:               resb (2+2+4+8)
         sockaddrlen             equ $-sockaddr
+        sockaddrlen_addr:       resd 1
 
         ; The bitmap used to track living sockets and as select argument
         ; typedef struct {
@@ -55,9 +57,9 @@ section .bss
         max_parallel_sockets    equ 64
 
         ; For storing socket descriptors we we care about
-        socketarray:           resd max_parallel_sockets        
+        socketarray:            resd max_parallel_sockets        
         ; Used in conjunction with socketarray to map socket to port
-        portarray:             resw max_parallel_sockets        
+        portarray:              resw max_parallel_sockets        
 
         ; The source and target IPv4 addresses in network byte order
         victimaddr:             resd 1                  
@@ -86,42 +88,40 @@ section .bss
         sendbuflen:             resd 1                 
         recvbuflen:             resd 1               
 
-        ; For storing the file descriptor mapped to /dev/urandom
+        ; To store the file descriptor mapped to /dev/urandom
         devrfd:                 resd 1
 
-        ; Useful constants 
+        ; Useful miscellaneous constants 
         iphdrlen                equ 20                  
         icmphdrlen              equ 8                  
         EINPROGRESS             equ -115
         EAGAIN                  equ -11
         TH_SYN                  equ 0x2 
-        TH_RST                  equ 0x3 
 
-; ==============================================================================
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 section .text
         global  _start
 
 _start:
         mov ebp, esp
-        ; String operations will hereby increment pointers by default
+        ; String operations increment pointers by default
         cld                             
 
 check_argc:
-        ; We want to make sure program was invoked with a single argument
+        ; Make sure we were invoked with one argument
         cmp [ebp], dword 2
-        jne wrong_argument_count
-        jmp parse_argv
-        
-        wrong_argument_count:
-        ; Print usage string
-        ; Exit with exit code 1
+        je parse_argv
+
+        ; Print usage string and exit with exit code 1
         push dword -1 
         push dword usage_msg
         call premature_exit
 
 parse_argv:
-        ; Parse first argument and store octets into buffer
+        ; Parse the IP string into octets and store them into a buffer
         push dword victimaddr           
         push dword [ebp + 8]           
         call parse_octets             
@@ -129,13 +129,9 @@ parse_argv:
 
         ; Check return value
         test eax, eax      
-        js malformed_ip_error           
-        jmp load_sockaddr
+        jns load_sockaddr           
 
-        malformed_ip_error:
-        ; The IPv4 address didn't look right
-        ; Print error message complaining about malformed ip
-        ; Exit with exit code 1
+        ; Complain about malformed ip and exit with exit code 1
         push dword -1
         push dword parse_error_msg            
         call premature_exit                  
@@ -145,186 +141,167 @@ load_sockaddr:
         ; Set the protocol family to AF_INET
         mov ax, 2
         stosw
-        ; Zero out the port for now
+        ; Set the port to zero for now
         xor ax, ax
         stosw
-        ; IPv4 address was valid; point socket address to it
-        ; From now on, use this struct when sending packets to host
         mov eax, [victimaddr]
         stosd
+        ; Store the address length in a buffer as well
+        mov [sockaddrlen_addr], dword sockaddrlen
 
 check_root:
-        ; If root user, attempt ICMP ping and perform SYN scan
+        ; Root user has uid = 0
         call sys_getuid
         cmp eax, 0
         je isr00t
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-; non-root users start here
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-; Attempt to establish TCP connections for ports 0-1023, printing port if successful 
-; Scan ports 0-1023, current port always stored in ebx
 xor ebx, ebx 
-connect_scan_loop: 
-        ; Reset index into sockets, portarray
+tcp_scan_loop: 
         xor esi, esi 
-        ; Store nfds (= 1 + maximum fd) for sys_select
         xor edi, edi 
-        connect_scan_gather_sockets:
-                ; Create socket with arguments
-                ; SOCK_STREAM|O_NONBLOCK, IPPROTO_TCP
-                push dword 6 
-                push dword (1 | 4000q) 
-                call spawn_socket
-                add esp, 8
+        ; ebx stores port counter 
+        ; esi stores array index 
+        ; edi stores highest numbered socket descriptor 
+        tcp_scan_connect_loop:
+                ; socket(PF_INET, (SOCK_STREAM | O_NONBLOCK), IPPROTO_TCP)
+                tcp_scan_create_socket:
+                        push dword 6 
+                        push dword (1 | 4000q) 
+                        call spawn_socket
+                        add esp, 8
 
-                ; Check return value
+                ; Return value should be a socket descriptor
                 test eax, eax
-                ; sys_socket failed with -errno
-                js connect_scan_socket_error 
-                jmp connect_scan_save_socket
+                jns tcp_scan_store_socket
 
-                connect_scan_socket_error:
-                ; We had trouble creating the socket
-                ; Save socket(2) errno on stack
+                ; Otherwise, print socket error message and exit with errno
                 push eax 
                 push socket_error_msg
                 call premature_exit
 
-                connect_scan_save_socket:
-                ; Socket seems good, save it to our array and map the port 
-                mov [socketarray + 4 * esi], eax 
-                mov [portarray + 2 * esi], word bx 
-                inc esi
-                ; Update nfds: max(nfds, fd)
-                cmp eax, edi
-                cmovg edi, eax
+                ; Save socket to array and map it to the port 
+                tcp_scan_store_socket:
+                        mov [socketarray + 4 * esi], eax 
+                        mov [portarray + 2 * esi], word bx 
+                        ; Update highest file descriptor
+                        cmp eax, edi
+                        cmovg edi, eax
 
-                connect_scan_attempt_connect:
-                ; Initiate TCP handshake to port
-                ; Load port to sockaddr struct in htons() order
-                mov [sockaddr + 2], byte bh 
-                mov [sockaddr + 3], byte bl 
-                push sockaddrlen
-                push sockaddr        
-                push eax 
-                call sys_connect
-                add esp, 12
+                ; Load sockaddr with port in network byte order 
+                tcp_scan_connect:
+                        mov [sockaddr + 2], byte bh 
+                        mov [sockaddr + 3], byte bl 
+                        push sockaddrlen
+                        push sockaddr        
+                        push eax 
+                        call sys_connect
+                        add esp, 12
 
-                connect_scan_check_connect_errno:
-                ; We expect to see EAGAIN or EINPROGRESS
+                ; The errno returned should say in progress or try again
                 cmp eax, EINPROGRESS
-                je connect_scan_socket_in_progress
+                je tcp_scan_next_socket
                 cmp eax, EAGAIN
-                je connect_scan_socket_in_progress
+                je tcp_scan_next_socket
                 cmp eax, 0
-                ; This would be very unexpected!
-                je connect_scan_socket_complete
+                je tcp_scan_next_socket
 
-                ; Connect failed for reasons other than being "in progress"
-                ; Save connect(2) -errno on stack
+                ; Otherwise, print connect error message and exit with errno
                 push eax 
                 push connect_error_msg
                 call premature_exit
 
-                connect_scan_socket_complete:
-                connect_scan_socket_in_progress:
-                ; "Gather" next socket-port combination or proceed to next step
+                ; Prepare next iteration or break loop
+                tcp_scan_next_socket:
+                ; Increment array index and port 
                 inc word bx
+                inc esi
                 cmp esi, max_parallel_sockets
-                jl connect_scan_gather_sockets
+                jl tcp_scan_connect_loop
 
-        connect_scan_sleep:
-        ; Copy default timeout to tv_volatile
-        mov [tv_volatile + 4], dword 500000
-        ; Wait for requested connects to finish
-        push tv_volatile
-        push dword 0
-        push dword 0
-        push dword 0
-        push dword 0
-        call sys_select
-        add esp, 20
+        ; Wait for requested connects to finish or timeout
+        tcp_scan_sleep:
+                ; Copy default timeout to tv_volatile
+                mov [tv_volatile + 4], dword 500000
+                push tv_volatile
+                push dword 0
+                push dword 0
+                push dword 0
+                push dword 0
+                call sys_select
+                add esp, 20
 
-        connect_scan_monitor:
-        ; Copy masterfds to wrfds 
-        mov esi, masterfds
-        mov edi, wrfds
-        mov ecx, masterfdslen
-        rep movsd
-        ; Wake up and smell the ashes...
-        ; Time to check up on our sockets
-        push tv_zero
-        push dword 0
-        push dword wrfds
-        push dword 0
-        ; nfds = maximum fd + 1
-        inc edi 
-        push edi
-        call sys_select
-        add esp, 20
+        ; Monitor sockets with select
+        tcp_scan_select:
+                ; Update wrfds with socket descriptors of living sockets
+                mov esi, masterfds
+                mov edi, wrfds
+                mov ecx, masterfdslen
+                rep movsd
+                push tv_zero
+                push dword 0
+                push dword wrfds
+                push dword 0
+                ; Highest numbered file descriptor + 1
+                inc edi 
+                push edi
+                call sys_select
+                add esp, 20
 
-        ; Check return value
+        ; Reset array index
+        xor esi, esi
+        ; Select returns the number of bits set in wrfds, or -errno if error
         cmp eax, 0
-        ; All sockets will block on write, skip to next iteration
-        je connect_scan_cleanup
-        jns connect_scan_check_for_connected_sockets 
+        je tcp_scan_cleanup
+        jns tcp_scan_write_loop 
 
-        ; We had some sort of trouble with select(2)
-        ; Save select(2) -errno on stack 
+        ; Print select error message and exit with errno
         push eax
         push select_error_msg
         call premature_exit
 
-        connect_scan_check_for_connected_sockets:
-        ; Check wrfds for our sockets
-        ; Reset index into socket array
-        xor esi, esi
-        connect_scan_iterate_through_fds:
-                ; Check if write_blocks:
-                ; Fetch file descriptor
+        ; Traverse array and write to sockets set in wrfds 
+        tcp_scan_write_loop:
+                ; If the bit mapped to the socket is cleared, the socket is not
+                ; ready for writing and the state of our TCP connection is
+                ; unknown.  This exposes a possible filtered port that dropped
+                ; our TCP connect request.
                 mov eax, [socketarray + 4 * esi]
                 bt [wrfds], eax
+                jnc tcp_scan_port_filtered 
 
-                ; This port didn't respond to our TCP request:
-                ; this means it was probably filtered
-                jnc connect_scan_port_was_filtered 
+                ; Otherwise, try writing 0 bytes to the socket
+                tcp_scan_write:
+                        push dword 0
+                        push dword 0
+                        push eax
+                        call sys_write
+                        add esp, 12 
 
-                connect_scan_send_empty_packet:
-                ; Seems like the socket can be written to
-                ; Let's try to send an empty dud packet to the host
-                push dword 0
-                push dword 0
-                push eax
-                call sys_write
-                add esp, 12 
+                ; Write should return number of bytes written, or -errno
                 test eax, eax
-                ; We had trouble sending: 
-                ; the port was probably closed
-                js connect_scan_port_was_closed
+                js tcp_scan_port_closed
                 
+                ; The write succeeded, which means the TCP connection is active
                 connect_scan_print_port:
-                ; We found an open port!
-                ; Convert the port number to a printable string
-                push port_open_fmtstr
-                movzx eax, word [portarray + 2 * esi]
-                push eax
-                call print_port
-                add esp, 4
+                        ; Convert the port number to a printable string
+                        push port_open_fmtstr
+                        movzx eax, word [portarray + 2 * esi]
+                        push eax
+                        call print_port
+                        add esp, 4
 
-                connect_scan_port_was_filtered:
-                connect_scan_port_was_closed:
-                connect_scan_check_next_socket:
+                tcp_scan_port_filtered:
+                tcp_scan_port_closed:
                 inc esi
                 cmp esi, max_parallel_sockets
-                jl connect_scan_iterate_through_fds
+                jl tcp_scan_write_loop
 
-        connect_scan_cleanup:
-        ; Kill all the sockets we opened 
+        tcp_scan_cleanup:
         call free_all_sockets
-        ; Check if we're done
         cmp bx, word 1024 
-        jl connect_scan_loop
+        jl tcp_scan_loop
         jmp exit
 
 isr00t:
