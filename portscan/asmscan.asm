@@ -391,8 +391,8 @@ ping_host:
                 mov eax, max_timeout
                 mov ecx, [tv_volatile + 4]
                 sub eax, ecx
-                ; RTT * 4 
-                shl eax, 2
+                ; RTT * 2 
+                shl eax, 1
                 mov [tv_master + 4], eax   
                 ; Read the socket for a response
                 mov [recvbuflen], dword 0xffff
