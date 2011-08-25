@@ -26,8 +26,8 @@ asmscan.o: asmscan.asm
 
 ==========[ 0x3 Usage ]
 
-$ ./portscan
-Usage: portscan <target ip>
+$ ./asmscan
+Usage: asmscan <target ip>
 
 ==========[ 0x4 Operation ]
 
