@@ -278,14 +278,15 @@ tcp_scan_loop:
         inc esi
         cmp esi, max_parallel_sockets
         jl tcp_scan_write_loop
-
+; Clean up socket descriptors
 tcp_scan_cleanup:
-        ; Clean up socket descriptors
         call free_all_sockets
         ; Check if we scanned the last port
         cmp bx, word 1024 
         jl tcp_scan_loop
         jmp exit
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ping_host:
         ; Create a raw socket with protocol IPPROTO_ICMP
@@ -420,7 +421,7 @@ ping_host:
                 lea esi, [recvbuf + 16]
                 mov edi, myaddr
                 movsd
-        ; Print expected latency (mostly useful for debugging)
+        ; Print expected latency (useful for debugging)
         ping_host_print_result:
                 ; Convert microseconds to milliseconds
                 mov eax, [tv_master + 4]
@@ -439,12 +440,13 @@ ping_host:
                 mov [esp], dword latency_fmtstr2
                 call printstr
                 add esp, 4
-
+; Close socket descriptor
 ping_host_cleanup:
-        ; Close socket descriptor
         push dword [socketarray]
         call free_socket
         add esp, 4
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 syn_scan:
         ; socket(PF_INET, (SOCK_RAW | NON_BLOCK), IPPROTO_TCP)
@@ -589,13 +591,14 @@ syn_scan:
         syn_scan_next_batch:
         cmp ebx, 1024
         jl syn_scan_loop
-
 ; Clean up file descriptors and exit
 syn_scan_cleanup:
         push dword [devrfd]
         call sys_close
         add esp, 4
         call free_all_sockets
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 exit:
         mov ebp, esp
@@ -604,7 +607,7 @@ exit:
         int 0x80
 
 ; ------------------------------------------------------------------------------
-; send_tcp_raw
+; send_tcp_raw:
 ;       Send a raw tcp header to the specified port
 ;               Expects: stack - socket file descriptor, port, type
 ;                        devrfd - contains file descriptor mapped to random
@@ -648,8 +651,7 @@ send_tcp_raw:
         stosw
         ; Urgent pointer = 0 (not used)
         stosw
-
-        ;;; Prepare TCP pseudo-header ;;;
+        ; Prepare TCP pseudo-header
         ; struct pseudo_hdr {
         ;       u_int32_t src;          /* 32bit source ip address*/
         ;       u_int32_t dst;          /* 32bit destination ip address */      
@@ -673,19 +675,16 @@ send_tcp_raw:
         mov ax, 20
         xchg al, ah
         stosw
-
-        ;;; Calculate TCP header + pseudo-header checksum ;;;
+        ; Calculate TCP header and pseudo-header checksum
         push dword (20+12)
         push sendbuf
         call cksum
         add esp, 8
         ; Store checksum in TCP header
         mov [sendbuf + 16], ax
-
         ; Set the length in bytes to send
         mov [sendbuflen], dword 20
-
-        ;;; Send the SYN packet! ;;;
+        ; Send the SYN packet
         push dword [ebp + 8]
         call send_packet
         add esp, 4
@@ -712,18 +711,16 @@ cksum:
         mov ecx, [ebp + 12]
         ; The accumulator
         xor edx, edx
-
         ; For the strange condition that length given was zero
         cmp ecx, 0
-        jz .done
-        .loop:
+        jz cksum_done
+        cksum_loop:
                 xor eax, eax
                 ; Load esi to lower 16 bis of eax
                 lodsw
                 add edx, eax
                 dec ecx 
-                jnz .loop
-
+                jnz cksum_loop
         ; Take the upper 16 bits of edx and add it to lower 16 bits
         mov eax, edx
         and eax, 0xffff
@@ -736,7 +733,7 @@ cksum:
         ; Take the one's complement
         not eax
 
-        .done:
+        cksum_done:
         pop esi
         mov esp, ebp
         pop ebp
@@ -752,10 +749,11 @@ printstr:
         push ebp         
         mov ebp, esp      
         
+        ; Get string length
         push dword [ebp + 8] 
         call strlen         
         add esp, 4         
-        
+        ; Write to standard output
         push eax               
         push dword [ebp + 8]  
         push dword 1         
@@ -782,7 +780,6 @@ strlen:
         not ecx
         mov edi, [ebp + 8]
         repne scasb
-        
         not ecx
         lea eax, [ecx - 1]
         
@@ -900,19 +897,19 @@ strtoul:
         mov edx, [ebp + 8]
         ; Clear "result" register
         xor eax, eax
-        loop_digits:
+        strtoul_loop:
                 ; Load ecx with character
                 movzx ecx, byte [edx]
                 inc edx
                 ; Terminate if NUL byte
                 cmp cl, byte 0
-                je exit_strtoul
+                je strtoul_done
                 ; Multiply current result by 10,
                 ; then add current character - '0'
                 lea eax, [eax + eax * 4]
                 lea eax, [ecx + eax * 2 - '0']
-                jmp loop_digits
-        exit_strtoul:
+                jmp strtoul_loop
+        strtoul_done:
         mov esp, ebp
         pop ebp
         ret
@@ -941,7 +938,7 @@ ultostr:
         mov ebx, 10
         ; eax: quotient contains the rest of input number
         ; edx: remainder contains the digit we want to write
-        .loop:
+        ultostr_loop:
                 xor edx, edx
                 div ebx
                 add dl, byte '0'
@@ -950,7 +947,7 @@ ultostr:
                 inc ecx
                 ; Stop if eax is 0
                 cmp eax, 0
-                jne .loop
+                jne ultostr_loop
         ; Copy chars on stack to destination buffer
         ; They will be in order because stack grows down
         mov esi, esp
@@ -976,23 +973,21 @@ spawn_socket:
         push ebp
         mov ebp, esp
 
-        ; push protocol
+        ; Push protocol
         push dword [ebp + 12]
-        ; push type
+        ; Push type
         push dword [ebp + 8]
         ; PF_INET by default
         push dword 2
         call sys_socket
         add esp, 12
-
         ; Check return value
         test eax, eax
-        js .done
-        
+        js spawn_socket_done
         ; Add it to "master" fd bitfield
         bts [masterfds], eax
 
-        .done:
+        spawn_socket_done:
         mov esp, ebp
         pop ebp
         ret
@@ -1031,29 +1026,28 @@ free_all_sockets:
         mov eax, 1023
         lea ecx, [masterfds + masterfdslen]
         ; Find dword containing highest numbered file descriptor
-        .find:
+        find_highest_socket_descriptor:
                 cmp [ecx], dword 0
-                jnz .loop
+                jnz free_all_sockets_loop
                 sub eax, 32
                 sub ecx, 4
-                jmp .find
-
+                jmp find_highest_socket_descriptor
         ; Loop through remaining bits in fdset
-        .loop:
+        free_all_sockets_loop:
                 ; Clear bit to zero and store original bit in CF
                 btr [masterfds], eax
                 ; If bit was set, close the mapped socket
-                jc .close
-                jmp .next
-
-                .close:
-                push eax
-                call sys_close
-                pop eax
-
-                .next:
-                dec eax
-                jns .loop
+                jc close_socket
+                ; Otherwise go to next socket
+                jmp free_next_socket
+                close_socket:
+                        push eax
+                        call sys_close
+                        pop eax
+        ; Keep looking for sockets to free until counter is negative
+        free_next_socket:
+        dec eax
+        jns free_all_sockets_loop
 
         mov esp, ebp
         pop ebp
@@ -1073,18 +1067,15 @@ premature_exit:
         push dword [ebp + 8]
         call printstr
         add esp, 4
-
         ; Close file descriptor mapped to /dev/urandom 
         cmp dword [devrfd], 0
         je premature_exit_close_sockets
         push dword [devrfd]
         call sys_close
         add esp, 4
-        
         ; Free all open sockets (raw, icmp, tcp, etc...)
         premature_exit_close_sockets:
         call free_all_sockets
-
         ; Convert -errno to errno
         mov ebx, [ebp + 12]
         not ebx
@@ -1286,7 +1277,6 @@ sys_sendto:
         mov ebp, esp
         push ebx
 
-        ; sys_socketcall = 102
         mov eax, 102
         mov ebx, 11
         lea ecx, [ebp + 8] 
@@ -1308,7 +1298,6 @@ sys_recvfrom:
         mov ebp, esp
         push ebx
 
-        ; sys_socketcall = 102
         mov eax, 102
         mov ebx, 12
         lea ecx, [ebp + 8] 
@@ -1414,15 +1403,10 @@ print_port:
         push dword [ebp + 8]
         call ultostr 
         add esp, 8
-
         ; Print port number
         push dword writebuf 
         call printstr 
-
         ; Swap buffers
-        ; Examples:
-        ; printf("%d is closed\n", port);
-        ; printf("%d is open\n", port);
         mov eax, [ebp + 12]
         mov [esp], eax
         call printstr
